@@ -125,14 +125,21 @@ def confirm_upload(request):
         "upload_token": "jwt_token",
         "s3_key": "videos/2024/01/15/uuid_video.mp4",
         "duration": 120.5,
-        "thumbnail_url": "optional_thumbnail_url"
+        "thumbnail_url": "optional_thumbnail_url",
+        "video_datetime": "2024-11-08T10:30:00Z"
     }
     
     Response:
     {
+        "success": true,
         "video_id": 123,
         "message": "업로드가 완료되었습니다.",
-        "video": { ... }
+        "video": { ... },
+        "processing_info": {
+            "trigger": "S3 Event Notification",
+            "status": "pending",
+            "note": "GPU 처리가 자동으로 시작됩니다"
+        }
     }
     """
     try:
@@ -162,7 +169,7 @@ def confirm_upload(request):
 
         # 비디오 메타데이터 DB 저장
         try:
-            logger.info(f"📦 Video 데이터 준비: file_name={token_payload['file_name']}, s3_key={s3_key}")
+            logger.info(f"Video 데이터 준비: file_name={token_payload['file_name']}, s3_key={s3_key}")
             
             # thumbnail_url에서 S3 키만 추출 (전체 URL이 아닌)
             thumbnail_s3_key = ''
@@ -179,7 +186,7 @@ def confirm_upload(request):
                     # 이미 키 형식이면 그대로 사용
                     thumbnail_s3_key = thumbnail_url
             
-            logger.info(f"🖼️ Thumbnail S3 key: {thumbnail_s3_key[:100]}...")  # 처음 100자만 로깅
+            logger.info(f"Thumbnail S3 key: {thumbnail_s3_key[:100]}...")  # 처음 100자만 로깅
             
             video_data = {
                 'name': token_payload['file_name'],
@@ -197,37 +204,19 @@ def confirm_upload(request):
             if video_datetime:
                 video_data['recorded_at'] = video_datetime
             
-            logger.info(f"🔨 Video.objects.create 호출 중...")
+            logger.info(f"Video.objects.create 호출 중...")
             video = Video.objects.create(**video_data)
-            logger.info(f"✅ Video 생성 성공: video_id={video.video_id}")
+            logger.info(f"Video 생성 성공: video_id={video.video_id}")
             
             serializer = VideoSerializer(video)
-            logger.info(f"✅ Serializer 생성 성공")
+            logger.info(f"Serializer 생성 성공")
             
         except Exception as db_error:
-            logger.error(f"❌ DB 저장 실패: {type(db_error).__name__}: {str(db_error)}")
-            logger.error(f"📋 video_data: {video_data}")
+            logger.error(f"DB 저장 실패: {type(db_error).__name__}: {str(db_error)}")
+            logger.error(f"video_data: {video_data}")
             import traceback
-            logger.error(f"📚 Traceback: {traceback.format_exc()}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             raise
-        
-        # 🚀 SQS 메시지 발행: 비디오 처리 요청
-        sqs_result = sqs_service.send_video_processing_message(
-            s3_bucket=s3_service.bucket_name,
-            s3_key=s3_key,
-            video_id=str(video.video_id),
-            additional_data={
-                'video_name': token_payload['file_name'],
-                'file_size': token_payload['file_size'],
-                'duration': duration
-            }
-        )
-        
-        if sqs_result['success']:
-            logger.info(f"SQS 메시지 발송 성공: video_id={video.video_id}, message_id={sqs_result['message_id']}")
-        else:
-            logger.error(f"SQS 메시지 발송 실패: video_id={video.video_id}, error={sqs_result['error']}")
-            # SQS 실패해도 업로드는 성공으로 처리 (비동기 처리이므로)
         
         logger.info(f"비디오 업로드 완료: video_id={video.video_id}, s3_key={s3_key}")
         
@@ -236,21 +225,25 @@ def confirm_upload(request):
             'video_id': video.video_id,
             'message': '업로드가 완료되었습니다.',
             'video': serializer.data,
-            'processing_queued': sqs_result['success']
+            'processing_queued': {
+                'trigger': 'S3 Event Notification',
+                'status': 'pending',
+                'note': 'S3가 자동으로 SQS에 메시지를 발송하며, Lambda가 EC2 GPU 인스턴스를 시작합니다.',
+            }
         }, status=status.HTTP_201_CREATED)
         
     except ValueError as e:
-        logger.error(f"❌ [ValueError] 업로드 확인 실패: {e}")
+        logger.error(f"[ValueError] 업로드 확인 실패: {e}")
         import traceback
-        logger.error(f"📚 Traceback: {traceback.format_exc()}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return Response(
             {'error': str(e)}, 
             status=status.HTTP_400_BAD_REQUEST
         )
     except Exception as e:
-        logger.error(f"❌ [Exception] 서버 오류: {type(e).__name__}: {str(e)}")
+        logger.error(f"[Exception] 서버 오류: {type(e).__name__}: {str(e)}")
         import traceback
-        logger.error(f"📚 Traceback: {traceback.format_exc()}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return Response(
             {'error': f'서버 내부 오류: {type(e).__name__}: {str(e)}'}, 
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
