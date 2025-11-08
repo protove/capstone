@@ -1,4 +1,6 @@
+# ============================================
 # S3 버킷들
+# ============================================
 
 # 1. 원본 영상 저장 버킷 (Raw Videos)
 resource "aws_s3_bucket" "raw_videos" {
@@ -83,6 +85,55 @@ resource "aws_s3_bucket_cors_configuration" "raw_videos" {
     expose_headers  = ["ETag", "x-amz-server-side-encryption", "x-amz-request-id"]
     max_age_seconds = 3000
   }
+}
+
+# ============================================
+# S3 Event Notification --> S3
+# ============================================
+
+# S3 Event Notification 설정
+resource "aws_s3_bucket_notification" "raw_videos_notification" {
+  bucket = aws_s3_bucket.raw_videos.id
+
+  # SQS 큐로 이벤트 전송
+  queue {
+    queue_arn = aws_sqs_queue.video_processing.arn
+    
+    events = ["s3:ObjectCeated:*"]
+    filter_prefix = "video/"
+    filter_suffix = ".mp4" #필요시 추가할 필요있음
+  }
+
+  depends_on = [aws_sqs_queue_policy.s3_to_sqs]
+}
+
+# SQS Queue Policy
+resource "aws_sqs_queue_policy" "s3_to_sqs" {
+  queue_url = aws_sqs_queue.video_processing.url
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid = "AllowS3ToSendMessageToSQS"
+        Effect = "Allow"
+
+        Principal = {
+          Service = "s3.amazonaws.com"
+        }
+
+        Action = "sqs:SendMessage
+
+        Resource = aws_sqs_queue.video_processing.arn
+
+        Condition = {
+          ArnEquals = {
+            "aws:SorceArn" = aws_s3_bucket.raw_videos.arn
+          }
+        }
+      }
+    ]
+  })
 }
 
 # Thumbnails - Versioning
@@ -189,8 +240,17 @@ output "s3_raw_videos_bucket" {
   value       = aws_s3_bucket.raw_videos.id
 }
 
+output "s3_raw_videos_arn" {
+  description = "Raw video S3 bucket ARN"
+  value = aws_s3_bucket.raw_video.arn
+}
+
 output "s3_thumbnails_bucket" {
   description = "Thumbnails S3 bucket name"
   value       = aws_s3_bucket.thumbnails.id
 }
 
+output "s3_highlights_bucket" {
+  description = "Highlights S3 bucket name"
+  value = aws_s3_bucket.highlights.id
+}
