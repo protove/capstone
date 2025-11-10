@@ -1,7 +1,7 @@
 """
 EC2 GPU Video Processing Worker
-SQS Long Polling을 통한 비디오 처리 워커
-가시성 타임아웃 자동 관리 포함
+Lambda 트리거로 시작되는 One-Shot 모드 워커
+SQS Long Polling을 통한 비디오 처리
 """
 
 import os
@@ -14,6 +14,7 @@ import boto3
 import traceback
 import subprocess
 import requests
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -56,14 +57,14 @@ logger = logging.getLogger('GPUWorker')
 
 class GPUVideoWorker:
     """
-    EC2 GPU 비디오 처리 워커
-    가시성 타임아웃 자동 관리 포함
+    EC2 GPU 비디오 처리 워커 (Lambda 트리거 One-Shot 모드)
     """
     
     def __init__(self):
         self.running = False
         self.processed_count = 0
         self.error_count = 0
+        self._stop_event = threading.Event()
         
         # 가시성 타임아웃 매니저 초기화
         self.visibility_manager = VisibilityTimeoutManager(sqs_service)
@@ -72,15 +73,37 @@ class GPUVideoWorker:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
+        # ========================================
+        # 실행 모드 설정
+        # ========================================
+        # ONE_SHOT_MODE: Lambda가 EC2를 시작하면 True
+        # CONTINUOUS: 개발/테스트용 (계속 실행)
+        self.one_shot_mode = os.environ.get('ONE_SHOT_MODE', 'true').lower() == 'true'
+        self.instance_id = self._get_instance_id()
+        
+        # ========================================
         # memi 경로 설정 (EFS 마운트)
+        # ========================================
         self.memi_path = Path(os.environ.get('MEMI_PATH', '/mnt/efs/memi'))
         self.memi_run_script = self.memi_path / 'run.py'
         
         # memi 설정 경로
-        self.detector_weights = os.environ.get('DETECTOR_WEIGHTS', '/mnt/efs/models/yolov8x_person_face.pt')
-        self.mivolo_checkpoint = os.environ.get('MIVOLO_CHECKPOINT', '/mnt/efs/models/model_imdb_cross_person_4.24_99.46.pth.tar')
-        self.mebow_cfg = os.environ.get('MEBOW_CFG', '/mnt/efs/config/mebow.yaml')
-        self.vlm_path = os.environ.get('VLM_PATH', '/mnt/efs/checkpoints/llava-fastvithd_0.5b_stage2')
+        self.detector_weights = os.environ.get(
+            'DETECTOR_WEIGHTS', 
+            '/mnt/efs/models/yolov8x_person_face.pt'
+        )
+        self.mivolo_checkpoint = os.environ.get(
+            'MIVOLO_CHECKPOINT', 
+            '/mnt/efs/models/model_imdb_cross_person_4.24_99.46.pth.tar'
+        )
+        self.mebow_cfg = os.environ.get(
+            'MEBOW_CFG', 
+            '/mnt/efs/config/mebow.yaml'
+        )
+        self.vlm_path = os.environ.get(
+            'VLM_PATH', 
+            '/mnt/efs/checkpoints/llava-fastvithd_0.5b_stage2'
+        )
         
         # memi 설치 확인
         if not self.memi_run_script.exists():
@@ -88,118 +111,97 @@ class GPUVideoWorker:
             logger.error("Please ensure EFS is mounted and memi is installed")
             raise FileNotFoundError(f"memi not found: {self.memi_run_script}")
         
-        logger.info(f"✅ memi found at: {self.memi_path}")
-        logger.info(f"   Detector: {self.detector_weights}")
-        logger.info(f"   MiVOLO: {self.mivolo_checkpoint}")
-        logger.info(f"   MEBOW: {self.mebow_cfg}")
-        logger.info(f"   VLM: {self.vlm_path}")
-    
-        
-        logger.info("GPU Video Worker 초기화 완료")
-        
-        # 실행 모드 설정
-        self.one_shot_mode = os.environ.get('ONE_SHOT_MODE', 'false').lower() == 'true'
-        self.instance_id = os.environ.get('INSTANCE_ID', 'unknown')
-        
-        logger.info(f"🚀 GPU Worker 초기화")
-        logger.info(f"   실행 모드: {'ONE-SHOT' if self.one_shot_mode else 'CONTINUOUS'}")
+        logger.info("=" * 60)
+        logger.info("GPU Video Worker 초기화")
+        logger.info("=" * 60)
+        logger.info(f"   실행 모드: {'ONE-SHOT (Lambda 트리거)' if self.one_shot_mode else 'CONTINUOUS (개발용)'}")
         logger.info(f"   Instance ID: {self.instance_id}")
+        logger.info(f"   memi 경로: {self.memi_path}")
+        logger.info(f"   Detector: {Path(self.detector_weights).name}")
+        logger.info(f"   MiVOLO: {Path(self.mivolo_checkpoint).name}")
+        logger.info(f"   MEBOW: {Path(self.mebow_cfg).name}")
+        logger.info(f"   VLM: {Path(self.vlm_path).name}")
+        logger.info("=" * 60)
+    
+    def _get_instance_id(self) -> str:
+        """
+        EC2 인스턴스 ID 조회
+        
+        Returns:
+            인스턴스 ID (예: i-0123456789abcdef0)
+        """
+        try:
+            # 환경 변수에서 먼저 확인
+            instance_id = os.environ.get('INSTANCE_ID')
+            if instance_id:
+                return instance_id
+            
+            # EC2 메타데이터 서비스에서 조회
+            response = requests.get(
+                'http://169.254.169.254/latest/meta-data/instance-id',
+                timeout=2
+            )
+            
+            if response.status_code == 200:
+                return response.text.strip()
+            
+            logger.warning("인스턴스 ID 조회 실패, 기본값 사용")
+            return 'unknown'
+            
+        except Exception as e:
+            logger.warning(f"인스턴스 ID 조회 오류: {e}")
+            return 'unknown'
     
     def _signal_handler(self, signum, frame):
         """시그널 핸들러 - Graceful Shutdown"""
         logger.info(f"시그널 {signum} 수신 - 워커 종료 중...")
         self.running = False
+        self._stop_event.set()
         self._print_final_statistics()
     
     def _print_final_statistics(self):
         """최종 통계 및 오류 요약 출력"""
         logger.info("=" * 60)
-        logger.info(" GPU Video Worker 최종 통계")
+        logger.info("GPU Video Worker 최종 통계")
         logger.info("=" * 60)
         
         # 기본 통계
-        logger.info(f" 처리 통계:")
-        logger.info(f"    성공: {self.processed_count}건")
-        logger.info(f"    실패: {self.error_count}건")
+        logger.info(f"   처리 성공: {self.processed_count}건")
+        logger.info(f"   처리 실패: {self.error_count}건")
         
         total_messages = self.processed_count + self.error_count
         if total_messages > 0:
             success_rate = (self.processed_count / total_messages) * 100
-            logger.info(f"   📈 성공률: {success_rate:.1f}%")
+            logger.info(f"   성공률: {success_rate:.1f}%")
         
         # 오류 통계
         error_summary = error_tracker.get_error_summary()
         if error_summary['total_errors'] > 0:
-            logger.info(f"   오류 요약:")
-            logger.info(f"   전체 오류: {error_summary['total_errors']}건")
-            logger.info(f"   오류 타입 수: {error_summary['error_types']}개")
-            logger.info(f"   가장 빈번한 오류: {error_summary['most_common_error']}")
-            logger.info(f"   오류 발생 함수: {error_summary['functions_with_errors']}개")
-        
-        # 가시성 타임아웃 통계
-        if hasattr(self.visibility_manager, 'get_statistics'):
-            visibility_stats = self.visibility_manager.get_statistics()
-            logger.info(f"   가시성 타임아웃 통계:")
-            logger.info(f"   관리 메시지: {visibility_stats.get('managed_messages', 0)}건")
-            logger.info(f"   연장 횟수: {visibility_stats.get('extensions', 0)}회")
+            logger.info(f"      오류 요약:")
+            logger.info(f"      전체 오류: {error_summary['total_errors']}건")
+            logger.info(f"      오류 타입: {error_summary['error_types']}개")
+            logger.info(f"      최다 오류: {error_summary['most_common_error']}")
         
         logger.info("=" * 60)
     
     def start_worker_loop(self):
         """
         메인 워커 루프 시작
-        Long Polling으로 SQS 메시지를 지속적으로 수신하고 처리
+        Lambda 트리거 시 One-Shot 모드로 실행
         """
         logger.info("GPU Video Worker 시작...")
-        logger.info(f"현재 상태: 처리완료={self.processed_count}, 오류={self.error_count}")
         
         # 가시성 타임아웃 모니터링 시작
         self.visibility_manager.start_monitoring()
         
-        self.running = True
-        consecutive_empty_polls = 0
-        max_empty_polls = 3  # 연속으로 빈 폴링 3회시 잠시 대기
-        
         try:
             if self.one_shot_mode:
-                logger.info("🔥 ONE-SHOT 모드 시작")
+                logger.info("ONE-SHOT 모드 실행 (Lambda 트리거)")
                 self._process_one_shot()
             else:
-                logger.info("♾️  CONTINUOUS 모드 시작")
-                while self.running:
-                    try:
-                        # SQS Long Polling으로 메시지 수신 (20초 대기)
-                        logger.debug("SQS 메시지 수신 중... (Long Polling 20초)")
-                        messages = sqs_service.receive_messages(
-                            max_messages=1,
-                            wait_time_seconds=20,
-                            visibility_timeout=300  # 5분 기본 가시성 타임아웃
-                        )
-                        
-                        if messages:
-                            consecutive_empty_polls = 0
-                            for message in messages:
-                                if not self.running:
-                                    break
-                                self._process_message_with_visibility_management(message)
-                        else:
-                            consecutive_empty_polls += 1
-                            logger.debug(f"수신된 메시지 없음 ({consecutive_empty_polls}/3)")
-                            
-                            # 연속으로 빈 메시지가 여러 번 나오면 잠시 대기
-                            if consecutive_empty_polls >= max_empty_polls:
-                                logger.info("잠시 대기 중... (30초)")
-                                time.sleep(30)
-                                consecutive_empty_polls = 0
-                    
-                    except KeyboardInterrupt:
-                        logger.info("사용자에 의한 종료")
-                        break
-                    except Exception as e:
-                        logger.error(f"워커 루프 오류: {e}")
-                        self.error_count += 1
-                        time.sleep(10)  # 오류 시 10초 대기
-            
+                logger.info("CONTINUOUS 모드 실행 (개발용)")
+                self._process_continuous()
+                
         finally:
             # 가시성 타임아웃 모니터링 중지
             self.visibility_manager.stop_monitoring()
@@ -207,124 +209,233 @@ class GPUVideoWorker:
             # 최종 통계 출력
             self._print_final_statistics()
             logger.info("🏁 GPU Video Worker 완전 종료")
-
+    
     def _process_one_shot(self):
         """
-        One-Shot 모드: 큐의 모든 메시지 처리 후 종료
+        One-Shot 모드: 큐의 모든 메시지 처리 후 자동 종료
+        
+        플로우:
+        1. SQS에서 메시지 폴링 (20초 Long Polling)
+        2. 메시지가 있으면 처리
+        3. 3번 연속 빈 큐면 종료
+        4. EC2 인스턴스 자동 종료
         """
         consecutive_empty_polls = 0
         max_empty_polls = 3  # 3번 연속 빈 큐면 종료
         
-        logger.info("One-Shot 처리 시작...")
+        logger.info("=" * 60)
+        logger.info("⚡ One-Shot 처리 시작 (Lambda 트리거 모드)")
+        logger.info(f"   Instance ID: {self.instance_id}")
+        logger.info(f"   최대 빈 폴링 횟수: {max_empty_polls}회")
+        logger.info("=" * 60)
+        
+        self.running = True
         
         while consecutive_empty_polls < max_empty_polls and not self._stop_event.is_set():
             try:
-                # SQS에서 메시지 수신
+                # SQS에서 메시지 수신 (Long Polling 20초)
+                logger.debug("📥 SQS 메시지 폴링 중... (20초 대기)")
                 messages = sqs_service.receive_messages(
                     max_messages=1,
-                    wait_time_seconds=20
+                    wait_time_seconds=20,
+                    visibility_timeout=300  # 5분
                 )
                 
                 if not messages:
                     consecutive_empty_polls += 1
-                    logger.info(f"메시지 없음 ({consecutive_empty_polls}/{max_empty_polls})")
+                    logger.info(f"📭 메시지 없음 ({consecutive_empty_polls}/{max_empty_polls})")
                     
                     if consecutive_empty_polls >= max_empty_polls:
-                        logger.info("메시지 처리 완료. 종료합니다.")
+                        logger.info("✅ 모든 메시지 처리 완료. 종료합니다.")
                         break
                     
                     continue
                 
                 # 메시지가 있으면 카운터 리셋
                 consecutive_empty_polls = 0
+                logger.info(f"📨 메시지 수신: {len(messages)}개")
                 
                 # 메시지 처리
                 for message in messages:
+                    if self._stop_event.is_set():
+                        logger.info("⏹️  중지 신호 수신, 루프 종료")
+                        break
+                    
                     try:
                         self._process_message_with_visibility_management(message)
                     except Exception as e:
-                        logger.error(f"메시지 처리 실패: {e}")
+                        logger.error(f"❌ 메시지 처리 실패: {e}")
+                        error_tracker.record_error(
+                            e,
+                            context="One-Shot 메시지 처리",
+                            function_name="_process_one_shot"
+                        )
                 
+            except KeyboardInterrupt:
+                logger.info("⌨️  사용자 중단 (Ctrl+C)")
+                break
             except Exception as e:
-                logger.error(f"One-Shot 루프 오류: {e}", exc_info=True)
+                logger.error(f"❌ One-Shot 루프 오류: {e}", exc_info=True)
                 time.sleep(10)
-        
-        # 최종 통계
-        self._print_final_statistics()
-        
-        # EC2 인스턴스 자동 종료
-        if self.one_shot_mode:
+    
+        # ✨ 개선: EC2 자동 종료 (One-Shot 모드에서만)
+        if self.one_shot_mode and self.instance_id != 'unknown':
+            logger.info("=" * 60)
+            logger.info("🔌 One-Shot 모드 완료 - EC2 인스턴스 자동 종료")
+            logger.info("=" * 60)
             self._stop_ec2_instance()
+        else:
+            logger.info("⚠️  EC2 자동 종료 건너뜀 (instance_id={})".format(self.instance_id))
+    
+    def _process_continuous(self):
+        """
+        Continuous 모드: 계속 실행 (개발/테스트용)
+        
+        주의: 프로덕션에서는 사용하지 마세요! (비용 발생)
+        """
+        logger.warning("CONTINUOUS 모드는 개발/테스트용입니다!")
+        logger.warning("프로덕션에서는 ONE_SHOT_MODE=true를 사용하세요!")
+        
+        consecutive_empty_polls = 0
+        max_empty_polls = 3
+        
+        self.running = True
+        
+        while self.running:
+            try:
+                # SQS Long Polling으로 메시지 수신
+                logger.debug("📥 SQS 메시지 폴링 중... (20초 대기)")
+                messages = sqs_service.receive_messages(
+                    max_messages=1,
+                    wait_time_seconds=20,
+                    visibility_timeout=300
+                )
+                
+                if messages:
+                    consecutive_empty_polls = 0
+                    for message in messages:
+                        if not self.running:
+                            break
+                        self._process_message_with_visibility_management(message)
+                else:
+                    consecutive_empty_polls += 1
+                    logger.debug(f"📭 메시지 없음 ({consecutive_empty_polls}/{max_empty_polls})")
+                    
+                    # 연속으로 빈 메시지가 여러 번 나오면 잠시 대기
+                    if consecutive_empty_polls >= max_empty_polls:
+                        logger.info("😴 잠시 대기 중... (30초)")
+                        time.sleep(30)
+                        consecutive_empty_polls = 0
+            
+            except KeyboardInterrupt:
+                logger.info("⌨️  사용자 중단 (Ctrl+C)")
+                break
+            except Exception as e:
+                logger.error(f"❌ 워커 루프 오류: {e}")
+                self.error_count += 1
+                time.sleep(10)
     
     def _stop_ec2_instance(self):
-        """현재 EC2 인스턴스를 자동으로 종료"""
+        """
+        현재 EC2 인스턴스를 자동으로 종료
+        
+        주의:
+        - IAM 역할에 ec2:StopInstances 권한 필요
+        - One-Shot 모드에서만 호출됨
+        """
         try:
-            logger.info(f"EC2 인스턴스 종료 중: {self.instance_id}")
+            if self.instance_id == 'unknown':
+                logger.error("인스턴스 ID를 알 수 없어 종료할 수 없습니다.")
+                logger.error("수동으로 EC2 콘솔에서 인스턴스를 종료하세요!")
+                return
             
-            ec2_client = boto3.client('ec2', region_name=os.environ.get('AWS_REGION', 'ap-northeast-2'))
+            logger.info(f"EC2 인스턴스 종료 시작: {self.instance_id}")
             
-            ec2_client.stop_instances(InstanceIds=[self.instance_id])
+            ec2_client = boto3.client(
+                'ec2',
+                region_name=os.environ.get('AWS_REGION', 'ap-northeast-2')
+            )
             
-            logger.info(f"EC2 인스턴스 종료 명령 전송: {self.instance_id}")
+            # 인스턴스 종료 명령
+            response = ec2_client.stop_instances(InstanceIds=[self.instance_id])
+            
+            stopping_instances = response['StoppingInstances']
+            if stopping_instances:
+                previous_state = stopping_instances[0]['PreviousState']['Name']
+                current_state = stopping_instances[0]['CurrentState']['Name']
+                logger.info(f"EC2 인스턴스 종료 명령 전송 완료")
+                logger.info(f"   이전 상태: {previous_state}")
+                logger.info(f"   현재 상태: {current_state}")
+            else:
+                logger.warning("인스턴스 종료 응답이 비어있음")
             
         except Exception as e:
-            logger.error(f"EC2 종료 실패: {e}")
-            logger.error("수동으로 인스턴스를 종료하세요!")
+            logger.error(f"EC2 종료 실패: {type(e).__name__}: {str(e)}")
+            logger.error("수동으로 EC2 콘솔에서 인스턴스를 종료하세요!")
+            logger.error(f"   Instance ID: {self.instance_id}")
     
     def _process_message_with_visibility_management(self, message: Dict[str, Any]):
         """
         SQS 메시지 처리 (가시성 타임아웃 자동 관리 + 오류 처리)
+        
+        Args:
+            message: SQS 메시지
         """
         receipt_handle = message.get('ReceiptHandle')
         message_body = message.get('Body', '{}')
         
         try:
-            # 메시지 파싱 (오류 처리 포함)
+            # S3 Event 파싱
             success, payload = safe_execute(
-                json.loads, 
-                message_body,
+                self._parse_message_body,
+                message,
                 context=f"메시지 파싱 (handle={receipt_handle[:10]}...)"
             )
             
             if not success:
-                logger.error(f"메시지 파싱 실패: {payload}")
-                # 파싱 실패 시 메시지 삭제 (잘못된 형식)
+                logger.error(f"❌ 메시지 파싱 실패: {payload}")
                 sqs_service.delete_message(receipt_handle)
                 self.error_count += 1
                 return
             
-            video_id = payload.get('video', {}).get('id')
-            s3_bucket = payload.get('s3', {}).get('bucket')
-            s3_key = payload.get('s3', {}).get('key')
+            # S3 Event 형식에서 정보 추출
+            video_id = payload.get('video_id')
+            s3_bucket = payload.get('bucket')
+            s3_key = payload.get('key')
             
-            logger.info(f"메시지 처리 시작: video_id={video_id}, s3_key={s3_key}")
+            logger.info(f"📋 메시지 처리 시작:")
+            logger.info(f"   video_id: {video_id}")
+            logger.info(f"   s3_bucket: {s3_bucket}")
+            logger.info(f"   s3_key: {s3_key}")
             
             # 필수 정보 검증
-            if not all([video_id, s3_bucket, s3_key]):
-                error_msg = f"필수 정보 누락: video_id={video_id}, bucket={s3_bucket}, key={s3_key}"
-                logger.error(f"{error_msg}")
-                error_tracker.record_error(
-                    ValueError(error_msg), 
-                    context=f"메시지 검증 video_id={video_id}",
-                    function_name="_process_message_with_visibility_management"
-                )
-                # 필수 정보 누락 시 메시지 삭제 (재처리 불가)
+            if not all([s3_bucket, s3_key]):
+                error_msg = f"필수 정보 누락: bucket={s3_bucket}, key={s3_key}"
+                logger.error(f"❌ {error_msg}")
                 sqs_service.delete_message(receipt_handle)
                 self.error_count += 1
                 return
             
-            # 파일 크기 기반으로 예상 처리 시간 계산
+            # video_id가 없으면 경고 (S3 키로 처리 가능)
+            if not video_id:
+                logger.warning(f"⚠️  video_id 없음, S3 키로 처리: {s3_key}")
+            
+            # 파일 크기 기반 예상 처리 시간 계산
             estimated_time = self._estimate_processing_time_safe(s3_key)
             
             # 가시성 타임아웃 관리 시작
             self.visibility_manager.register_message(
-                receipt_handle, 
-                video_id, 
+                receipt_handle,
+                video_id or s3_key,
                 estimated_time
             )
             
             # 비디오 처리 실행 (재시도 로직 포함)
-            processing_result = self._process_video_with_retry(video_id, s3_bucket, s3_key)
+            processing_result = self._process_video_with_retry(
+                video_id, 
+                s3_bucket, 
+                s3_key
+            )
             
             if processing_result['success']:
                 # 처리 완료 - 메시지 삭제
@@ -335,26 +446,27 @@ class GPUVideoWorker:
                 )
                 
                 self.visibility_manager.unregister_message(receipt_handle, 'completed')
+                
                 if success:
                     self.processed_count += 1
-                    logger.info(f"비디오 처리 완료: video_id={video_id}")
+                    logger.info(f"✅ 비디오 처리 완료: video_id={video_id}")
                 else:
-                    logger.warning(f"처리는 성공했지만 메시지 삭제 실패: video_id={video_id}")
+                    logger.warning(f"⚠️  처리 성공, 메시지 삭제 실패: video_id={video_id}")
                     
             else:
-                # 처리 실패 - 메시지 가시성 복구 (다른 워커가 재처리 가능)
+                # 처리 실패
                 error_type = processing_result.get('error_type', 'unknown')
                 
                 if error_type == 'permanent':
                     # 영구적 오류 - 메시지 삭제
-                    logger.error(f"영구적 오류로 메시지 삭제: video_id={video_id}")
+                    logger.error(f"❌ 영구적 오류, 메시지 삭제: video_id={video_id}")
                     sqs_service.delete_message(receipt_handle)
                 else:
-                    # 일시적 오류 - 가시성 복구하여 재처리 가능하게 함
-                    logger.warning(f"일시적 오류로 재처리 대기: video_id={video_id}")
+                    # 일시적 오류 - 재처리 대기
+                    logger.warning(f"⚠️  일시적 오류, 재처리 대기: video_id={video_id}")
                     safe_execute(
                         sqs_service.change_message_visibility,
-                        receipt_handle, 
+                        receipt_handle,
                         0,  # 즉시 가시성 복구
                         context=f"가시성 복구 video_id={video_id}"
                     )
@@ -364,9 +476,9 @@ class GPUVideoWorker:
                 
         except Exception as e:
             # 예상치 못한 오류
-            logger.error(f"메시지 처리 중 예상치 못한 오류: {e}")
+            logger.error(f"❌ 메시지 처리 중 예상치 못한 오류: {e}")
             error_tracker.record_error(
-                e, 
+                e,
                 context=f"메시지 처리 handle={receipt_handle[:10]}...",
                 function_name="_process_message_with_visibility_management"
             )
@@ -376,13 +488,13 @@ class GPUVideoWorker:
                 sqs_service.change_message_visibility(receipt_handle, 0)
                 self.visibility_manager.unregister_message(receipt_handle, 'error')
             except:
-                pass  # 복구 시도도 실패하면 그냥 넘어감
+                pass
                 
             self.error_count += 1
     
     def _estimate_processing_time_safe(self, s3_key: str) -> int:
         """
-        S3 키를 기반으로 예상 처리 시간 계산 (오류 처리 포함)
+        S3 키를 기반으로 예상 처리 시간 계산
         
         Args:
             s3_key: S3 객체 키
@@ -403,16 +515,16 @@ class GPUVideoWorker:
                 # 파일 크기 기반 예상 시간 (MB당 1초 + 기본 120초)
                 size_mb = file_size / (1024 * 1024)
                 estimated_time = max(120, int(size_mb * 1.0 + 120))
-                logger.debug(f"파일 크기 기반 예상 시간: {size_mb:.1f}MB → {estimated_time}초")
+                logger.debug(f"📊 파일 크기 기반 예상 시간: {size_mb:.1f}MB → {estimated_time}초")
                 return estimated_time
         except Exception as e:
-            logger.warning(f"파일 크기 조회 실패, 기본값 사용: {e}")
+            logger.warning(f"⚠️  파일 크기 조회 실패, 기본값 사용: {e}")
         
         # 파일 확장자 기반 기본 예상 시간
         if s3_key.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-            return 600  # 비디오 파일: 10분
+            return 600  # 비디오: 10분
         elif s3_key.lower().endswith(('.jpg', '.png', '.jpeg', '.gif')):
-            return 120  # 이미지 파일: 2분
+            return 120  # 이미지: 2분
         else:
             return 300  # 기본: 5분
     
@@ -500,78 +612,6 @@ class GPUVideoWorker:
         
         logger.info(f"업로드 완료: s3://{s3_bucket}/{s3_key}")
         return True
-    
-    def _estimate_processing_time(self, s3_key: str) -> int:
-        """
-        S3 키를 기반으로 예상 처리 시간 계산
-        
-        Args:
-            s3_key: S3 객체 키
-            
-        Returns:
-            예상 처리 시간 (초)
-        """
-        # 파일 확장자 기반 기본 예상 시간
-        if s3_key.lower().endswith(('.mp4', '.avi', '.mov')):
-            return 600  # 비디오 파일: 10분
-        elif s3_key.lower().endswith(('.jpg', '.png', '.jpeg')):
-            return 120  # 이미지 파일: 2분
-        else:
-            return 300  # 기본: 5분
-    
-    def _process_message(self, message: Dict[str, Any]):
-        """
-        SQS 메시지 처리 (기존 방식 - 호환성 유지)
-        """
-        receipt_handle = message.get('ReceiptHandle')
-        message_body = message.get('Body', '{}')
-        
-        try:
-            # 메시지 파싱
-            payload = json.loads(message_body)
-            video_id = payload.get('video', {}).get('id')
-            s3_bucket = payload.get('s3', {}).get('bucket')
-            s3_key = payload.get('s3', {}).get('key')
-            
-            logger.info(f"메시지 처리 시작: video_id={video_id}, s3_key={s3_key}")
-            
-            # 필수 정보 검증
-            if not all([video_id, s3_bucket, s3_key]):
-                raise ValueError(f"필수 정보 누락: video_id={video_id}, s3_bucket={s3_bucket}, s3_key={s3_key}")
-            
-            # 가시성 타임아웃 연장 (처리 시작 알림)
-            sqs_service.change_message_visibility(receipt_handle, 600)  # 10분 연장
-            
-            # 비디오 처리 실행
-            processing_result = self._process_video(video_id, s3_bucket, s3_key)
-            
-            if processing_result['success']:
-                # 처리 완료 - 메시지 삭제
-                sqs_service.delete_message(receipt_handle)
-                self.processed_count += 1
-                logger.info(f"비디오 처리 완료: video_id={video_id}")
-            else:
-                # 처리 실패 - 메시지 가시성 복구 (다른 워커가 재처리 가능)
-                sqs_service.change_message_visibility(receipt_handle, 0)
-                self.error_count += 1
-                logger.error(f"비디오 처리 실패: video_id={video_id}, error={processing_result['error']}")
-        
-        except json.JSONDecodeError as e:
-            logger.error(f"메시지 파싱 실패: {e}")
-            # 잘못된 형식의 메시지는 삭제
-            sqs_service.delete_message(receipt_handle)
-            self.error_count += 1
-        
-        except Exception as e:
-            logger.error(f"메시지 처리 오류: {e}")
-            traceback.print_exc()
-            self.error_count += 1
-            
-            # 처리 실패 시 메시지 가시성 복구
-            try:
-                sqs_service.change_message_visibility(receipt_handle, 0)
-            except:
-                pass
     
     def _process_video(self, video_id: str, s3_bucket: str, s3_key: str) -> Dict[str, Any]:
         """
@@ -707,33 +747,31 @@ class GPUVideoWorker:
             logger.error(f" {context} 실패: {type(e).__name__}: {str(e)}")
             raise
     
-    def _download_video_from_s3(self, s3_bucket: str, s3_key: str) -> str:
-        """S3에서 비디오 다운로드"""
-        # 임시 디렉토리 생성
-        temp_dir = SCRIPT_DIR / 'temp'
-        temp_dir.mkdir(exist_ok=True)
-        
-        # 로컬 파일 경로
-        file_name = Path(s3_key).name
-        local_path = temp_dir / f"{int(time.time())}_{file_name}"
-        
-        # S3에서 다운로드 (s3_service 사용)
+    def _update_video_status(self, video_id: str, status: str, data: Dict = None) -> bool:
+        """
+        비디오 상태 업데이트 (Django DB)
+        """
         try:
-            # Pre-signed URL 생성 후 다운로드 방식 사용
-            download_url = s3_service.generate_download_url(s3_key)
+            video = Video.objects.get(video_id=video_id)
             
-            response = requests.get(download_url, stream=True)
-            response.raise_for_status()
+            if status == 'completed':
+                video.processing_status = 'completed'
+                video.analysis_status = 'completed'
+                video.analyzed_at = datetime.now(timezone.utc)
+                if data:
+                    video.major_event = data
+            elif status == 'failed':
+                video.processing_status = 'failed'
+                video.analysis_status = 'failed'
+                if data:
+                    video.error_info = data
             
-            with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            logger.info(f"비디오 다운로드 완료: {local_path}")
-            return str(local_path)
+            video.save()
+            logger.info(f"✅ 비디오 상태 업데이트: video_id={video_id}, status={status}")
+            return True
             
         except Exception as e:
-            logger.error(f"S3 다운로드 실패: {e}")
+            logger.error(f"❌ 상태 업데이트 실패: {e}")
             raise
     
     def _run_gpu_inference(self, video_path: str) -> Dict[str, Any]:
@@ -977,7 +1015,6 @@ class GPUVideoWorker:
                     }
                     
                     # S3 key에서 video_id 추출
-                    # 방법 1: Django API 호출
                     video_id = self._get_video_id_from_django(parsed['key'])
                     
                     if video_id:
@@ -1027,13 +1064,22 @@ class GPUVideoWorker:
             logger.error(f"Django API 호출 실패: {e}")
             return None
     
+    def _cleanup_temp_files(self, file_path: str):
+        """임시 파일 정리"""
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"🗑️ 임시 파일 삭제: {file_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ 임시 파일 삭제 실패: {e}")
+    
 def main():
     """메인 실행 함수"""
     try:
         worker = GPUVideoWorker()
         worker.start_worker_loop()
     except Exception as e:
-        logger.error(f"워커 실행 실패: {e}")
+        logger.error(f"❌ 워커 실행 실패: {e}")
         traceback.print_exc()
         sys.exit(1)
 
