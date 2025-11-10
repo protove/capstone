@@ -12,6 +12,8 @@ import logging
 import signal
 import boto3
 import traceback
+import subprocess
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -70,7 +72,38 @@ class GPUVideoWorker:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
+        # memi 경로 설정 (EFS 마운트)
+        self.memi_path = Path(os.environ.get('MEMI_PATH', '/mnt/efs/memi'))
+        self.memi_run_script = self.memi_path / 'run.py'
+        
+        # memi 설정 경로
+        self.detector_weights = os.environ.get('DETECTOR_WEIGHTS', '/mnt/efs/models/yolov8x_person_face.pt')
+        self.mivolo_checkpoint = os.environ.get('MIVOLO_CHECKPOINT', '/mnt/efs/models/model_imdb_cross_person_4.24_99.46.pth.tar')
+        self.mebow_cfg = os.environ.get('MEBOW_CFG', '/mnt/efs/config/mebow.yaml')
+        self.vlm_path = os.environ.get('VLM_PATH', '/mnt/efs/checkpoints/llava-fastvithd_0.5b_stage2')
+        
+        # memi 설치 확인
+        if not self.memi_run_script.exists():
+            logger.error(f"memi run.py not found at: {self.memi_run_script}")
+            logger.error("Please ensure EFS is mounted and memi is installed")
+            raise FileNotFoundError(f"memi not found: {self.memi_run_script}")
+        
+        logger.info(f"✅ memi found at: {self.memi_path}")
+        logger.info(f"   Detector: {self.detector_weights}")
+        logger.info(f"   MiVOLO: {self.mivolo_checkpoint}")
+        logger.info(f"   MEBOW: {self.mebow_cfg}")
+        logger.info(f"   VLM: {self.vlm_path}")
+    
+        
         logger.info("GPU Video Worker 초기화 완료")
+        
+        # 실행 모드 설정
+        self.one_shot_mode = os.environ.get('ONE_SHOT_MODE', 'false').lower() == 'true'
+        self.instance_id = os.environ.get('INSTANCE_ID', 'unknown')
+        
+        logger.info(f"🚀 GPU Worker 초기화")
+        logger.info(f"   실행 모드: {'ONE-SHOT' if self.one_shot_mode else 'CONTINUOUS'}")
+        logger.info(f"   Instance ID: {self.instance_id}")
     
     def _signal_handler(self, signum, frame):
         """시그널 핸들러 - Graceful Shutdown"""
@@ -128,40 +161,45 @@ class GPUVideoWorker:
         max_empty_polls = 3  # 연속으로 빈 폴링 3회시 잠시 대기
         
         try:
-            while self.running:
-                try:
-                    # SQS Long Polling으로 메시지 수신 (20초 대기)
-                    logger.debug("SQS 메시지 수신 중... (Long Polling 20초)")
-                    messages = sqs_service.receive_messages(
-                        max_messages=1,
-                        wait_time_seconds=20,
-                        visibility_timeout=300  # 5분 기본 가시성 타임아웃
-                    )
-                    
-                    if messages:
-                        consecutive_empty_polls = 0
-                        for message in messages:
-                            if not self.running:
-                                break
-                            self._process_message_with_visibility_management(message)
-                    else:
-                        consecutive_empty_polls += 1
-                        logger.debug(f"수신된 메시지 없음 ({consecutive_empty_polls}/3)")
+            if self.one_shot_mode:
+                logger.info("🔥 ONE-SHOT 모드 시작")
+                self._process_one_shot()
+            else:
+                logger.info("♾️  CONTINUOUS 모드 시작")
+                while self.running:
+                    try:
+                        # SQS Long Polling으로 메시지 수신 (20초 대기)
+                        logger.debug("SQS 메시지 수신 중... (Long Polling 20초)")
+                        messages = sqs_service.receive_messages(
+                            max_messages=1,
+                            wait_time_seconds=20,
+                            visibility_timeout=300  # 5분 기본 가시성 타임아웃
+                        )
                         
-                        # 연속으로 빈 메시지가 여러 번 나오면 잠시 대기
-                        if consecutive_empty_polls >= max_empty_polls:
-                            logger.info("잠시 대기 중... (30초)")
-                            time.sleep(30)
+                        if messages:
                             consecutive_empty_polls = 0
-                
-                except KeyboardInterrupt:
-                    logger.info("사용자에 의한 종료")
-                    break
-                except Exception as e:
-                    logger.error(f"워커 루프 오류: {e}")
-                    self.error_count += 1
-                    time.sleep(10)  # 오류 시 10초 대기
-        
+                            for message in messages:
+                                if not self.running:
+                                    break
+                                self._process_message_with_visibility_management(message)
+                        else:
+                            consecutive_empty_polls += 1
+                            logger.debug(f"수신된 메시지 없음 ({consecutive_empty_polls}/3)")
+                            
+                            # 연속으로 빈 메시지가 여러 번 나오면 잠시 대기
+                            if consecutive_empty_polls >= max_empty_polls:
+                                logger.info("잠시 대기 중... (30초)")
+                                time.sleep(30)
+                                consecutive_empty_polls = 0
+                    
+                    except KeyboardInterrupt:
+                        logger.info("사용자에 의한 종료")
+                        break
+                    except Exception as e:
+                        logger.error(f"워커 루프 오류: {e}")
+                        self.error_count += 1
+                        time.sleep(10)  # 오류 시 10초 대기
+            
         finally:
             # 가시성 타임아웃 모니터링 중지
             self.visibility_manager.stop_monitoring()
@@ -170,6 +208,69 @@ class GPUVideoWorker:
             self._print_final_statistics()
             logger.info("🏁 GPU Video Worker 완전 종료")
 
+    def _process_one_shot(self):
+        """
+        One-Shot 모드: 큐의 모든 메시지 처리 후 종료
+        """
+        consecutive_empty_polls = 0
+        max_empty_polls = 3  # 3번 연속 빈 큐면 종료
+        
+        logger.info("One-Shot 처리 시작...")
+        
+        while consecutive_empty_polls < max_empty_polls and not self._stop_event.is_set():
+            try:
+                # SQS에서 메시지 수신
+                messages = sqs_service.receive_messages(
+                    max_messages=1,
+                    wait_time_seconds=20
+                )
+                
+                if not messages:
+                    consecutive_empty_polls += 1
+                    logger.info(f"메시지 없음 ({consecutive_empty_polls}/{max_empty_polls})")
+                    
+                    if consecutive_empty_polls >= max_empty_polls:
+                        logger.info("메시지 처리 완료. 종료합니다.")
+                        break
+                    
+                    continue
+                
+                # 메시지가 있으면 카운터 리셋
+                consecutive_empty_polls = 0
+                
+                # 메시지 처리
+                for message in messages:
+                    try:
+                        self._process_message_with_visibility_management(message)
+                    except Exception as e:
+                        logger.error(f"메시지 처리 실패: {e}")
+                
+            except Exception as e:
+                logger.error(f"One-Shot 루프 오류: {e}", exc_info=True)
+                time.sleep(10)
+        
+        # 최종 통계
+        self._print_final_statistics()
+        
+        # EC2 인스턴스 자동 종료
+        if self.one_shot_mode:
+            self._stop_ec2_instance()
+    
+    def _stop_ec2_instance(self):
+        """현재 EC2 인스턴스를 자동으로 종료"""
+        try:
+            logger.info(f"EC2 인스턴스 종료 중: {self.instance_id}")
+            
+            ec2_client = boto3.client('ec2', region_name=os.environ.get('AWS_REGION', 'ap-northeast-2'))
+            
+            ec2_client.stop_instances(InstanceIds=[self.instance_id])
+            
+            logger.info(f"EC2 인스턴스 종료 명령 전송: {self.instance_id}")
+            
+        except Exception as e:
+            logger.error(f"EC2 종료 실패: {e}")
+            logger.error("수동으로 인스턴스를 종료하세요!")
+    
     def _process_message_with_visibility_management(self, message: Dict[str, Any]):
         """
         SQS 메시지 처리 (가시성 타임아웃 자동 관리 + 오류 처리)
@@ -238,7 +339,7 @@ class GPUVideoWorker:
                     self.processed_count += 1
                     logger.info(f"비디오 처리 완료: video_id={video_id}")
                 else:
-                    logger.warning(f"⚠️ 처리는 성공했지만 메시지 삭제 실패: video_id={video_id}")
+                    logger.warning(f"처리는 성공했지만 메시지 삭제 실패: video_id={video_id}")
                     
             else:
                 # 처리 실패 - 메시지 가시성 복구 (다른 워커가 재처리 가능)
@@ -621,7 +722,6 @@ class GPUVideoWorker:
             # Pre-signed URL 생성 후 다운로드 방식 사용
             download_url = s3_service.generate_download_url(s3_key)
             
-            import requests
             response = requests.get(download_url, stream=True)
             response.raise_for_status()
             
@@ -638,87 +738,295 @@ class GPUVideoWorker:
     
     def _run_gpu_inference(self, video_path: str) -> Dict[str, Any]:
         """
-        GPU 추론 실행 (Mock Implementation)
-        실제로는 여기에 GPU 모델 추론 코드를 구현
+        GPU 추론 실행 - memi run.py 호출
+        
+        Args:
+            video_path: 로컬 비디오 파일 경로
+        
+        Returns:
+            memi 분석 결과
         """
-        logger.info(f"GPU 추론 실행 중: {video_path}")
+        logger.info(f"memi GPU 추론 시작: {video_path}")
         
-        # TODO: 실제 GPU 추론 로직 구현
-        # 예: YOLOv8, MediaPipe, Custom Model 등
-        
-        # Mock 결과 (실제 구현 시 제거)
-        import random
-        mock_result = {
-            'processing_time': round(random.uniform(10, 60), 2),
-            'detected_objects': random.randint(5, 50),
-            'confidence_score': round(random.uniform(0.7, 0.95), 3),
-            'analysis_summary': f"Mock GPU 분석 완료 - {datetime.now(timezone.utc).isoformat()}",
-            'model_version': 'mock-v1.0'
-        }
-        
-        # GPU 처리 시뮬레이션 (5-10초)
-        processing_time = random.uniform(5, 10)
-        time.sleep(processing_time)
-        
-        logger.info(f"GPU 추론 완료: {processing_time:.2f}초")
-        return mock_result
-    
-    def _save_processing_result(self, video_id: str, result: Dict[str, Any]) -> bool:
-        """처리 결과 저장 (S3 또는 로컬)"""
         try:
-            # JSON 결과 파일 생성
-            result_data = {
-                'video_id': video_id,
-                'processed_at': datetime.now(timezone.utc).isoformat(),
-                'result': result
+            # 출력 디렉토리 생성
+            output_dir = SCRIPT_DIR / 'results' / f"video_{int(time.time())}"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # memi 명령어 구성
+            cmd = [
+                'python',
+                str(self.memi_run_script),
+                '--input', video_path,
+                '--output', str(output_dir),
+                '--detector-weights', self.detector_weights,
+                '--checkpoint', self.mivolo_checkpoint,
+                '--mebow-cfg', self.mebow_cfg,
+                '--vlm-path', self.vlm_path,
+                '--device', 'cuda:0',
+                '--with-persons',
+                '--draw'  # 시각화 결과 생성
+            ]
+            
+            logger.info(f"memi 명령어: {' '.join(cmd)}")
+            
+            # memi 실행 (subprocess)
+            start_time = time.time()
+            
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                cwd=str(self.memi_path)
+            )
+            # 실시간 로그 출력
+            output_lines = []
+            for line in process.stdout:
+                logger.info(f"[memi] {line.rstrip()}")
+                output_lines.append(line)
+            
+            # 프로세스 완료 대기
+            return_code = process.wait()
+            processing_time = time.time() - start_time
+            
+            if return_code != 0:
+                error_msg = f"memi 실행 실패 (exit code: {return_code})"
+                logger.error(f"{error_msg}")
+                logger.error(f"Output:\n{''.join(output_lines[-50:])}")  # 마지막 50줄만
+                raise RuntimeError(error_msg)
+            
+            logger.info(f"memi 분석 완료: {processing_time:.2f}초")
+            
+            # 결과 파일 파싱
+            result = self._parse_memi_results(output_dir)
+            result['processing_time'] = processing_time
+            result['output_dir'] = str(output_dir)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"memi 실행 오류: {type(e).__name__}: {str(e)}")
+            raise
+        
+    def _parse_memi_results(self, output_dir: Path) -> Dict[str, Any]:
+        """
+        memi 출력 결과 파싱
+        
+        Args:
+            output_dir: memi 출력 디렉토리
+        
+        Returns:
+            파싱된 결과 딕셔너리
+        """
+        try:
+            logger.info(f"memi 결과 파싱: {output_dir}")
+            
+            result = {
+                'status': 'completed',
+                'output_files': [],
+                'analysis_summary': {}
             }
             
-            # 임시로 로컬에 저장 (추후 S3로 업로드 가능)
-            result_dir = SCRIPT_DIR / 'results'
-            result_dir.mkdir(exist_ok=True)
+            # 출력 파일 목록
+            output_files = list(output_dir.glob('**/*'))
+            result['output_files'] = [str(f.relative_to(output_dir)) for f in output_files if f.is_file()]
             
-            result_file = result_dir / f"video_{video_id}_result.json"
-            with open(result_file, 'w', encoding='utf-8') as f:
-                json.dump(result_data, f, indent=2, ensure_ascii=False)
+            logger.info(f"   출력 파일 수: {len(result['output_files'])}")
             
-            logger.info(f"처리 결과 저장 완료: {result_file}")
-            return True
+            # JSON 결과 파일 찾기 (memi가 생성하는 경우)
+            json_files = list(output_dir.glob('*.json'))
+            if json_files:
+                with open(json_files[0], 'r') as f:
+                    analysis_data = json.load(f)
+                    result['analysis_summary'] = analysis_data
+                    logger.info(f"   JSON 결과 로드: {json_files[0].name}")
+            
+            # 비디오 파일 찾기 (시각화 결과)
+            video_files = list(output_dir.glob('*.mp4')) + list(output_dir.glob('*.avi'))
+            if video_files:
+                result['annotated_video'] = str(video_files[0])
+                logger.info(f"   시각화 비디오: {video_files[0].name}")
+            
+            return result
             
         except Exception as e:
-            logger.error(f"결과 저장 실패: {e}")
-            return False
+            logger.error(f"결과 파싱 실패: {e}")
+            return {
+                'status': 'completed',
+                'output_files': [],
+                'analysis_summary': {},
+                'error': str(e)
+            }
     
-    def _update_video_status(self, video_id: str, status: str, result: Dict[str, Any]):
-        """Django DB에서 비디오 상태 업데이트"""
+    def _save_processing_result(self, video_id: str, result: Dict[str, Any]) -> bool:
+        """
+        처리 결과를 Django DB + PostgreSQL에 저장
+    
+        Args:
+            video_id: 비디오 ID
+            result: memi 분석 결과
+    
+        Returns:
+            저장 성공 여부
+        """
         try:
+            logger.info(f"DB 저장 시작: video_id={video_id}")
+            
+            # Django ORM으로 Video 업데이트
             video = Video.objects.get(video_id=video_id)
             
-            # 비디오 상태 업데이트 (status 필드가 있다고 가정)
-            if hasattr(video, 'processing_status'):
-                video.processing_status = status
+            # major_event 필드에 분석 결과 저장 (JSONField)
+            video.major_event = result.get('analysis_summary', {})
             
-            # major_event 필드에 처리 결과 저장
-            video.major_event = json.dumps(result) if result else None
+            # processing_status 업데이트
+            if hasattr(video, 'processing_status'):
+                video.processing_status = 'completed'
+            
+            # analysis_status 업데이트
+            if hasattr(video, 'analysis_status'):
+                video.analysis_status = 'completed'
+            
+            # 처리 완료 시간
+            if hasattr(video, 'analyzed_at'):
+                video.analyzed_at = datetime.now(timezone.utc)
+            
             video.save()
             
-            logger.info(f"DB 업데이트 완료: video_id={video_id}, status={status}")
+            logger.info(f"DB 저장 완료: video_id={video_id}")
+            
+            # 시각화 비디오가 있으면 S3에 업로드
+            if 'annotated_video' in result:
+                self._upload_annotated_video_to_s3(video_id, result['annotated_video'])
+            
+            return True
             
         except Video.DoesNotExist:
-            logger.error(f"비디오를 찾을 수 없음: video_id={video_id}")
-        except Exception as e:
-            logger.error(f"DB 업데이트 실패: {e}")
-    
-    def _cleanup_temp_files(self, *file_paths):
-        """임시 파일 정리"""
-        for file_path in file_paths:
+            logger.error(f"Video not found: video_id={video_id}")
+            
+            # video_id가 없으면 새로 생성 (옵션)
+            logger.info(f"새로운 Video 레코드 생성 시도...")
             try:
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
-                    logger.debug(f"임시 파일 삭제: {file_path}")
-            except Exception as e:
-                logger.warning(f"파일 삭제 실패: {file_path}, {e}")
+                video = Video.objects.create(
+                    video_id=video_id,
+                    major_event=result.get('analysis_summary', {}),
+                    processing_status='completed',
+                    analysis_status='completed',
+                    analyzed_at=datetime.now(timezone.utc)
+                )
+                logger.info(f"새 Video 생성 완료: video_id={video_id}")
+                return True
+            except Exception as create_error:
+                logger.error(f"Video 생성 실패: {create_error}")
+                return False
+            
+        except Exception as e:
+            logger.error(f"DB 저장 실패: {e}")
+            return False
+    
+    def _upload_annotated_video_to_s3(self, video_id: str, video_path: str):
+        """시각화된 비디오를 S3에 업로드"""
+        try:
+            # S3 키 생성
+            s3_key = f"processed/{datetime.now().year}/{datetime.now().month:02d}/{datetime.now().day:02d}/video_{video_id}_annotated.mp4"
+            
+            # S3 업로드
+            s3_service.upload_file(video_path, s3_key)
+            
+            logger.info(f"시각화 비디오 업로드: s3://{s3_service.bucket_name}/{s3_key}")
+            
+            # Django DB에 processed_video_url 저장
+            video = Video.objects.get(video_id=video_id)
+            if hasattr(video, 's3_processed_key'):
+                video.s3_processed_key = s3_key
+                video.save()
+            
+        except Exception as e:
+            logger.error(f"시각화 비디오 업로드 실패: {e}")
+    
+    def _parse_message_body(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        SQS 메시지 파싱 (S3 Event Notification 형식)
+        
+        Args:
+            message: SQS 메시지
+        
+        Returns:
+            파싱된 메시지 정보
+        """
+        try:
+            body = json.loads(message['Body'])
+            
+            # S3 Event Notification 형식 파싱
+            if 'Records' in body and len(body['Records']) > 0:
+                record = body['Records'][0]
+                
+                # S3 이벤트인지 확인
+                if record.get('eventSource') == 'aws:s3':
+                    s3_info = record['s3']
+                    
+                    parsed = {
+                        'bucket': s3_info['bucket']['name'],
+                        'key': s3_info['object']['key'],
+                        'size': s3_info['object'].get('size', 0),
+                        'etag': s3_info['object'].get('eTag', ''),
+                        'event_time': record.get('eventTime'),
+                        'event_name': record.get('eventName')
+                    }
+                    
+                    # S3 key에서 video_id 추출
+                    # 방법 1: Django API 호출
+                    video_id = self._get_video_id_from_django(parsed['key'])
+                    
+                    if video_id:
+                        parsed['video_id'] = video_id
+                        logger.info(f"video_id 조회 성공: {video_id}")
+                    else:
+                        logger.warning(f"video_id를 찾을 수 없음, 새로 생성 필요: {parsed['key']}")
+                        parsed['video_id'] = None
+                    
+                    logger.info(f"S3 Event 파싱 완료: {parsed}")
+                    return parsed
+            
+            raise ValueError("Unknown message format")
+            
+        except Exception as e:
+            logger.error(f"메시지 파싱 실패: {e}")
+            raise
 
-
+    def _get_video_id_from_django(self, s3_key: str) -> Optional[str]:
+        """
+        S3 key로 Django API에서 video_id 조회
+        
+        Args:
+            s3_key: S3 객체 키
+        
+        Returns:
+            video_id
+        """
+        try:
+            # Django API 엔드포인트
+            django_api_url = os.environ.get('DJANGO_API_URL', 'http://backend:8000')
+            
+            response = requests.get(
+                f"{django_api_url}/db/videos/by-s3-key/",
+                params={'s3_key': s3_key},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return str(data['video_id'])
+            else:
+                logger.warning(f"Django API 응답: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Django API 호출 실패: {e}")
+            return None
+    
 def main():
     """메인 실행 함수"""
     try:
