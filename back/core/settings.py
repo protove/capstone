@@ -176,10 +176,39 @@ AWS_STORAGE_BUCKET_NAME = env('AWS_STORAGE_BUCKET_NAME', default='capstone-dev-r
 AWS_S3_REGION_NAME = env('AWS_DEFAULT_REGION', default='ap-northeast-2')
 AWS_S3_CUSTOM_DOMAIN = env('AWS_S3_CUSTOM_DOMAIN', default=None)
 
+# AWS 설정 검증 (필수 항목 체크)
+if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+    import warnings
+    warnings.warn(
+        "AWS_ACCESS_KEY_ID와 AWS_SECRET_ACCESS_KEY가 설정되지 않았습니다. "
+        "S3/SQS 기능이 비활성화됩니다."
+    )
+
 # S3 버킷 이름 설정
 AWS_RAW_BUCKET_NAME = env('AWS_RAW_BUCKET_NAME', default='capstone-dev-raw')
+AWS_STORAGE_BUCKET_NAME = AWS_RAW_BUCKET_NAME
 AWS_THUMBNAILS_BUCKET_NAME = env('AWS_THUMBNAILS_BUCKET_NAME', default='capstone-dev-thumbnails')
 AWS_HIGHLIGHTS_BUCKET_NAME = env('AWS_HIGHLIGHTS_BUCKET_NAME', default='capstone-dev-highlights')
+AWS_PROCESSED_BUCKET_NAME = env('AWS_PROCESSED_BUCKET_NAME', default='capstone-dev-processed-videos')
+
+#sqs 설정
+AWS_SQS_QUEUE_URL = env('AWS_SQS_QUEUE_URL', default=None)
+AWS_SQS_QUEUE_NAME = env('AWS_SQS_QUEUE_NAME', default='capstone-dev-video-processing')
+AWS_SQS_VISIBILITY_TIMEOUT = env('AWS_SQS_VISIBILITY_TIMEOUT', default=300, cast=int)
+AWS_SQS_WAIT_TIME_SECONDS = env('AWS_SQS_WAIT_TIME_SECONDS', default=20, cast=int)
+
+# Pre-signed URL 설정
+AWS_S3_PRESIGNED_URL_EXPIRATION = env('AWS_S3_PRESIGNED_URL_EXPIRATION', default=900, cast=int)
+UPLOAD_TOKEN_EXPIRATION = env('UPLOAD_TOKEN_EXPIRATION', default=900, cast=int)
+UPLOAD_TOKEN_SECRET_KEY = env('UPLOAD_TOKEN_SECRET_KEY', default=SECRET_KEY)
+
+# 파일 타입 제한
+MAX_VIDEO_FILE_SIZE = env('MAX_VIDEO_FILE_SIZE', default=10 * 1024 * 1024 * 1024, cast=int)
+ALLOWED_VIDEO_TYPES = ['video/mp4', 'video/avi', 'video/mov', 'video/wmv', 'video/quicktime', 'video/x-matroska']
+
+# GPU Worker API 설정
+DJANGO_API_URL = env('DJANGO_API_URL', default='http://backend:8000')
+DJANGO_API_INTERNAL_KEY = env('DJANGO_API_INTERNAL_KEY', default='internal-api-key-change-in-production')
 
 # 파일 저장소 설정 (AWS S3 vs 로컬)
 USE_S3 = bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_STORAGE_BUCKET_NAME)
@@ -259,6 +288,9 @@ REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
     ],
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20,
+    'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
 }
 
 # CSRF 설정 (API에서는 비활성화)
@@ -266,6 +298,11 @@ CSRF_TRUSTED_ORIGINS = [
     'http://localhost:8088',
     'http://127.0.0.1:8088',
     'http://host.docker.internal:8088',
+]
+
+# CSRF 제외 URL 패턴
+CSRF_EXEMPT_URLS = [
+    r'^api/s3/',  # S3 업로드 API는 CSRF 제외
 ]
 
 # Default primary key field type
