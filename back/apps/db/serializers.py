@@ -1,31 +1,111 @@
 from rest_framework import serializers
-from .models import Video, Event, PromptSession, PromptInteraction, DepthData, DisplayData
+from django.conf import settings
+import boto3
+from botocore.exceptions import ClientError
+from .models import Video, Event, PromptSession, PromptInteraction, DepthData, DisplayData, VideoAnalysis, AnalysisJob
 
 class VideoSerializer(serializers.ModelSerializer):
+    # 기존 호환성 필드들
     file_path = serializers.ReadOnlyField()
     computed_thumbnail_path = serializers.ReadOnlyField()
-    chat_count = serializers.SerializerMethodField()  # 동적으로 계산
+    chat_count = serializers.SerializerMethodField()
+    
+    # 새로운 클라우드 필드들
+    current_s3_url = serializers.SerializerMethodField()
+    thumbnail_url = serializers.SerializerMethodField()
+    tier_status = serializers.SerializerMethodField()
+    search_stats = serializers.SerializerMethodField()
     
     class Meta:
         model = Video
         fields = '__all__'
     
     def get_chat_count(self, obj):
-        """실제 PromptSession 수를 계산하여 반환"""
-        return obj.prompt_sessions.count()
+        """실제 PromptSession 수를 계산하여 반환 (기존 호환성)"""
+        if hasattr(obj, 'prompt_sessions'):
+            return obj.prompt_sessions.count()
+        return 0
+    
+    def get_current_s3_url(self, obj):
+        """현재 티어에 맞는 S3 URL 생성"""
+        if hasattr(obj, 'get_current_s3_key') and obj.get_current_s3_key():
+            return self._generate_s3_url(obj.get_current_s3_key())
+        return None
+    
+    def get_thumbnail_url(self, obj):
+        """썸네일 S3 URL 생성"""
+        thumbnail_key = getattr(obj, 'thumbnail_s3_key', None) or getattr(obj, 's3_thumbnail_key', None)
+        if thumbnail_key:
+            return self._generate_s3_url(thumbnail_key, is_thumbnail=True)
+        return None
+    
+    def get_tier_status(self, obj):
+        """데이터 티어 상태 정보"""
+        return {
+            'tier': getattr(obj, 'data_tier', 'hot'),
+            'hotness_score': getattr(obj, 'hotness_score', 0.0),
+            'search_count': getattr(obj, 'search_count', 0)
+        }
+    
+    def get_search_stats(self, obj):
+        """검색 통계 정보"""
+        return {
+            'total_searches': getattr(obj, 'search_count', 0) or getattr(obj, 'total_searches', 0),
+            'last_accessed': getattr(obj, 'last_accessed', None) or getattr(obj, 'last_searched', None),
+            'hotness_score': getattr(obj, 'hotness_score', 0.0)
+        }
+    
+    def _generate_s3_url(self, s3_key, is_thumbnail=False):
+        """S3 pre-signed URL 생성"""
+        if not s3_key:
+            return None
+        
+        try:
+            # AWS credentials와 region 명시적으로 설정
+            s3_client = boto3.client(
+                's3',
+                region_name=getattr(settings, 'AWS_S3_REGION_NAME', 'ap-northeast-2'),
+                aws_access_key_id=getattr(settings, 'AWS_ACCESS_KEY_ID', None),
+                aws_secret_access_key=getattr(settings, 'AWS_SECRET_ACCESS_KEY', None)
+            )
+            
+            # 썸네일은 별도 버킷 사용
+            bucket_name = 'capstone-dev-thumbnails' if is_thumbnail else getattr(settings, 'AWS_STORAGE_BUCKET_NAME', 'capstone-dev-raw')
+            
+            presigned_url = s3_client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': bucket_name,
+                    'Key': s3_key
+                },
+                ExpiresIn=3600  # 1시간
+            )
+            return presigned_url
+        except ClientError as e:
+            print(f"❌ S3 presigned URL 생성 실패: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ 예상치 못한 에러: {e}")
+            return None
     
     def create(self, validated_data):
-        """비디오 생성 시 로깅 추가"""
+        """비디오 생성 시 클라우드 필드 초기화"""
         print(f"🏗️ [VideoSerializer CREATE] 시작")
         print(f"📋 [VideoSerializer CREATE] Validated data: {validated_data}")
         
         try:
-            # 기본 create 호출
+            # 기본 생성
             instance = super().create(validated_data)
             
-            print(f"✅ [VideoSerializer CREATE] 생성 성공: video_id={instance.video_id}")
-            print(f"📊 [VideoSerializer CREATE] Instance data: {instance.__dict__}")
+            # 클라우드 필드 초기화
+            if hasattr(instance, 'data_tier') and not instance.data_tier:
+                instance.data_tier = 'hot'
+            if hasattr(instance, 'hotness_score') and not instance.hotness_score:
+                instance.hotness_score = 100.0  # 새 비디오는 hot
             
+            instance.save()
+            
+            print(f"✅ [VideoSerializer CREATE] 생성 성공: video_id={instance.video_id}")
             return instance
             
         except Exception as e:
@@ -35,53 +115,155 @@ class VideoSerializer(serializers.ModelSerializer):
             raise
 
 class EventSerializer(serializers.ModelSerializer):
+    # 기존 호환성 필드들
     timestamp_display = serializers.ReadOnlyField()
     absolute_time = serializers.ReadOnlyField()
     absolute_time_display = serializers.ReadOnlyField()
     
+    # 새로운 클라우드 필드들
+    searchable_content = serializers.SerializerMethodField()
+    similarity_score = serializers.SerializerMethodField()
+    tier_info = serializers.SerializerMethodField()
+    
+    # 썸네일 URL (Presigned URL 자동 생성)
+    thumbnail_url = serializers.SerializerMethodField()
+    
     class Meta:
         model = Event
         fields = '__all__'
+    
+    def get_thumbnail_url(self, obj):
+        """썸네일 Presigned URL 생성"""
+        return obj.thumbnail_url  # @property 메서드 사용
+    
+    def get_searchable_content(self, obj):
+        """검색 가능한 내용 생성"""
+        if hasattr(obj, 'searchable_text') and obj.searchable_text:
+            return obj.searchable_text
+        # 기존 필드들로 검색 텍스트 생성
+        parts = [
+            getattr(obj, 'event_type', ''),
+            getattr(obj, 'age_group', ''),
+            getattr(obj, 'gender', ''),
+            getattr(obj, 'action', ''),
+            getattr(obj, 'emotion', '')
+        ]
+        return " | ".join(filter(None, parts))
+    
+    def get_similarity_score(self, obj):
+        """벡터 검색 결과의 유사도 점수 (context에서 주입)"""
+        return getattr(obj, '_similarity_score', None)
+    
+    def get_tier_info(self, obj):
+        """데이터 티어 정보"""
+        return {
+            'tier': getattr(obj, 'data_tier', 'hot'),
+            'search_count': getattr(obj, 'search_count', 0),
+            'last_accessed': getattr(obj, 'last_accessed', None)
+        }
 
 class PromptSessionSerializer(serializers.ModelSerializer):
+    # 기존 호환성 필드들
     display_title = serializers.ReadOnlyField()
     timeline_summary = serializers.ReadOnlyField()
     main_event_display = serializers.ReadOnlyField()
-    main_event = EventSerializer(read_only=True)  # Event 정보를 포함하여 반환
-    video = VideoSerializer(read_only=True)  # Video 정보를 포함하여 반환
-    detected_events = serializers.SerializerMethodField()  # 프롬프트에서 찾은 이벤트들
+    main_event = EventSerializer(read_only=True)
+    video = VideoSerializer(read_only=True)
+    detected_events = serializers.SerializerMethodField()
+    
+    # 새로운 클라우드 필드들
+    context_summary = serializers.SerializerMethodField()
+    session_stats = serializers.SerializerMethodField()
+    related_videos_info = serializers.SerializerMethodField()
     
     class Meta:
         model = PromptSession
         fields = '__all__'
     
     def get_detected_events(self, obj):
-        """세션의 모든 프롬프트 인터랙션에서 찾은 이벤트들을 반환"""
+        """세션의 모든 프롬프트 인터랙션에서 찾은 이벤트들을 반환 (기존 호환성)"""
         detected_events = []
-        interactions = obj.interactions.filter(detected_event__isnull=False).select_related('detected_event')
+        interactions = obj.interactions.all()
         
         for interaction in interactions:
-            if interaction.detected_event:
-                event_info = {
-                    'event_type': interaction.detected_event.event_type,
-                    'action_detected': interaction.detected_event.action_detected,
-                    'timestamp': interaction.detected_event.timestamp,
-                    'location': interaction.detected_event.location,
-                    'prompt': interaction.input_prompt[:100] + '...' if len(interaction.input_prompt) > 100 else interaction.input_prompt  # 프롬프트 일부만 포함
-                }
-                detected_events.append(event_info)
+            # 관련 이벤트들 가져오기 (새로운 ManyToMany 관계)
+            related_events = getattr(interaction, 'related_events', None)
+            if related_events:
+                for event in related_events.all()[:3]:  # 최대 3개
+                    event_info = {
+                        'event_type': getattr(event, 'event_type', ''),
+                        'action_detected': getattr(event, 'action', ''),
+                        'timestamp': getattr(event, 'timestamp', 0),
+                        'location': f"{getattr(event, 'bbox_x', 0)},{getattr(event, 'bbox_y', 0)}",
+                        'prompt': interaction.user_prompt[:100] + '...' if len(interaction.user_prompt) > 100 else interaction.user_prompt
+                    }
+                    detected_events.append(event_info)
         
         return detected_events
+    
+    def get_context_summary(self, obj):
+        """세션 컨텍스트 요약"""
+        return getattr(obj, 'context_summary', '') or getattr(obj, 'session_summary', '')
+    
+    def get_session_stats(self, obj):
+        """세션 통계"""
+        return {
+            'total_interactions': getattr(obj, 'total_interactions', 0),
+            'status': getattr(obj, 'status', 'active'),
+            'last_interaction': getattr(obj, 'last_interaction', None)
+        }
+    
+    def get_related_videos_info(self, obj):
+        """관련 비디오 정보"""
+        if not hasattr(obj, 'related_videos'):
+            return []
+        
+        try:
+            return [
+                {
+                    'video_id': video.video_id,
+                    'name': getattr(video, 'name', '') or getattr(video, 'filename', ''),
+                    'duration': getattr(video, 'duration', 0)
+                }
+                for video in obj.related_videos.all()[:5]  # 최대 5개
+            ]
+        except Exception:
+            return []
 
 class PromptInteractionSerializer(serializers.ModelSerializer):
+    # 기존 호환성 필드들
     interaction_number = serializers.ReadOnlyField()
     is_first_in_session = serializers.ReadOnlyField()
     timeline_display = serializers.ReadOnlyField()
     processing_time_display = serializers.ReadOnlyField()
     
+    # 새로운 클라우드 필드들
+    thumbnail_urls = serializers.SerializerMethodField()
+    analysis_results = serializers.SerializerMethodField()
+    visual_elements = serializers.SerializerMethodField()
+    
     class Meta:
         model = PromptInteraction
         fields = '__all__'
+    
+    def get_thumbnail_urls(self, obj):
+        """생성된 썸네일 URL들"""
+        if hasattr(obj, 'thumbnail_s3_keys') and obj.thumbnail_s3_keys:
+            return obj.generate_thumbnail_urls()
+        return []
+    
+    def get_analysis_results(self, obj):
+        """분석 결과 정보"""
+        return {
+            'analysis_type': getattr(obj, 'analysis_type', ''),
+            'confidence_score': getattr(obj, 'confidence_score', 0.0),
+            'processing_time': getattr(obj, 'processing_time', 0.0),
+            'results': getattr(obj, 'analysis_results', {})
+        }
+    
+    def get_visual_elements(self, obj):
+        """감지된 시각적 요소들"""
+        return getattr(obj, 'visual_elements', [])
 
 class DepthDataSerializer(serializers.ModelSerializer):
     bbox_array = serializers.ReadOnlyField()
@@ -90,14 +272,94 @@ class DepthDataSerializer(serializers.ModelSerializer):
     depth_range = serializers.ReadOnlyField()
     frame_timestamp = serializers.ReadOnlyField()
     
+    # 새로운 클라우드 필드들
+    depth_map_url = serializers.SerializerMethodField()
+    tier_info = serializers.SerializerMethodField()
+    
     class Meta:
         model = DepthData
         fields = '__all__'
+    
+    def get_depth_map_url(self, obj):
+        """깊이 맵 S3 URL"""
+        if hasattr(obj, 'depth_map_s3_key') and obj.depth_map_s3_key:
+            return VideoSerializer()._generate_s3_url(obj.depth_map_s3_key)
+        return None
+    
+    def get_tier_info(self, obj):
+        """데이터 티어 정보"""
+        return {
+            'tier': getattr(obj, 'data_tier', 'hot')
+        }
 
 class DisplayDataSerializer(serializers.ModelSerializer):
     bbox_array = serializers.ReadOnlyField()
     center_x = serializers.ReadOnlyField()
     center_y = serializers.ReadOnlyField()
+    area = serializers.ReadOnlyField()
+    
+    # 새로운 클라우드 필드들
+    mask_image_url = serializers.SerializerMethodField()
+    tier_info = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = DisplayData
+        fields = '__all__'
+    
+    def get_mask_image_url(self, obj):
+        """마스크 이미지 S3 URL"""
+        if hasattr(obj, 'mask_image_s3_key') and obj.mask_image_s3_key:
+            return VideoSerializer()._generate_s3_url(obj.mask_image_s3_key)
+        return None
+    
+    def get_tier_info(self, obj):
+        """데이터 티어 정보"""
+        return {
+            'tier': getattr(obj, 'data_tier', 'hot')
+        }
+
+# 새로운 클라우드 전용 시리얼라이저들
+class VideoAnalysisSerializer(serializers.ModelSerializer):
+    searchable_content = serializers.ReadOnlyField(source='searchable_text')
+    keywords_list = serializers.ReadOnlyField(source='keywords')
+    tier_status = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = VideoAnalysis
+        fields = '__all__'
+    
+    def get_tier_status(self, obj):
+        return {
+            'tier': obj.data_tier,
+            'search_count': obj.search_count,
+            'last_accessed': obj.last_accessed
+        }
+
+class AnalysisJobSerializer(serializers.ModelSerializer):
+    duration_display = serializers.SerializerMethodField()
+    status_display = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = AnalysisJob
+        fields = '__all__'
+    
+    def get_duration_display(self, obj):
+        duration = obj.duration
+        if duration:
+            return f"{duration:.2f}초"
+        return "처리중"
+    
+    def get_status_display(self, obj):
+        status_map = {
+            'submitted': '제출됨',
+            'pending': '대기중',
+            'runnable': '실행가능',
+            'starting': '시작중',
+            'running': '실행중',
+            'succeeded': '성공',
+            'failed': '실패'
+        }
+        return status_map.get(obj.status, obj.status)
     area = serializers.ReadOnlyField()
     
     class Meta:

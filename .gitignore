@@ -17,11 +17,6 @@ front/yarn-debug.log*
 front/yarn-error.log*
 front/.pnpm-debug.log*
 
-# env files
-front/.env*
-.env
-.env.*
-
 # vercel
 front/.vercel
 
@@ -30,7 +25,6 @@ front/*.tsbuildinfo
 front/next-env.d.ts
 
 # Python/Django
-back/.env
 back/env/
 venv/
 ENV/
@@ -64,3 +58,59 @@ front/public/uploads/*
 
 #dummy data && file
 dummy*
+
+# env files (실제 환경변수 파일들 - 보안상 추적하지 않음)
+.env
+.env.local
+.env.dev
+.env.prod
+.env.production
+.env.development
+
+# AWS 관련 파일들 (보안)
+.aws/
+aws-credentials*
+*.pem
+*.key
+
+# Docker 관련 임시 파일들
+docker-compose.override.yml
+.docker/
+
+# 로그 파일들
+*.log
+logs/
+log/
+
+# 임시 파일들
+.tmp/
+temp/
+tmp/
+
+# env 템플릿 파일들은 추적됨 (.env.*.template)
+# Terraform 관련 파일들
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+tfplan
+tfplan.*
+.terraform.lock.hcl
+
+# localstack data
+localstack/
+
+# ISSUE 정리 파일
+ISSUE.md
+
+# memi 폴더 전체 제외
+memi/

@@ -1,12 +1,99 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import api_view, action
 from rest_framework.response import Response
+from django.http import JsonResponse
+from django.db import connection
+from django.conf import settings
 from apps.db.models import Video, Event, PromptSession, PromptInteraction
 from apps.db.serializers import VideoSerializer, EventSerializer, PromptSessionSerializer, PromptInteractionSerializer
+from apps.api.bedrock_service import get_bedrock_service
+from apps.api.hybrid_search_service import get_hybrid_search_service
+from apps.api.vlm_service import get_vlm_service
 import json
 import requests
 import re
-from django.db import connection
+
+# 헬스체크 엔드포인트
+@api_view(['GET'])
+def health_check(request):
+    """
+    헬스체크 엔드포인트 - 서버 상태 확인
+    ALB Target Group Health Check용
+    """
+    health_status = {
+        'status': 'healthy',
+        'timestamp': None,
+        'checks': {
+            'database': 'unknown',
+            'pgvector': 'unknown',
+            's3': 'unknown'
+        },
+        'details': {}
+    }
+    
+    try:
+        from django.utils import timezone
+        health_status['timestamp'] = timezone.now().isoformat()
+        
+        # 1. 데이터베이스 연결 확인
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                health_status['checks']['database'] = 'connected'
+        except Exception as e:
+            health_status['checks']['database'] = 'disconnected'
+            health_status['details']['database_error'] = str(e)
+            health_status['status'] = 'unhealthy'
+        
+        # 2. pgvector 확장 확인
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
+                result = cursor.fetchone()
+                if result:
+                    health_status['checks']['pgvector'] = 'enabled'
+                else:
+                    health_status['checks']['pgvector'] = 'disabled'
+        except Exception as e:
+            health_status['checks']['pgvector'] = 'error'
+            health_status['details']['pgvector_error'] = str(e)
+        
+        # 3. S3 연결 확인 (선택사항)
+        try:
+            import os
+            if os.environ.get('USE_S3', 'false').lower() == 'true':
+                import boto3
+                from botocore.exceptions import ClientError
+                
+                s3_client = boto3.client('s3')
+                bucket_name = os.environ.get('AWS_STORAGE_BUCKET_NAME')
+                
+                if bucket_name:
+                    try:
+                        s3_client.head_bucket(Bucket=bucket_name)
+                        health_status['checks']['s3'] = 'connected'
+                    except ClientError:
+                        health_status['checks']['s3'] = 'bucket_not_found'
+                else:
+                    health_status['checks']['s3'] = 'not_configured'
+            else:
+                health_status['checks']['s3'] = 'disabled'
+        except Exception as e:
+            health_status['checks']['s3'] = 'error'
+            health_status['details']['s3_error'] = str(e)
+        
+        # 최종 상태 결정
+        if health_status['checks']['database'] != 'connected':
+            return JsonResponse(health_status, status=503)
+        
+        return JsonResponse(health_status, status=200)
+    
+    except Exception as e:
+        return JsonResponse({
+            'status': 'unhealthy',
+            'error': str(e),
+            'message': 'Unexpected error occurred'
+        }, status=503)
 
 @api_view(['POST'])
 def process_prompt(request):
@@ -29,9 +116,12 @@ def process_prompt(request):
             return Response({"error": "프롬프트가 비어있습니다."}, status=status.HTTP_400_BAD_REQUEST)
         
         # 1. 세션 생성 또는 조회
+        video = None  # video 변수 초기화
         if session_id:
             try:
                 history = PromptSession.objects.get(session_id=session_id)
+                # 세션의 첫 번째 관련 비디오 가져오기
+                video = history.related_videos.first()
             except PromptSession.DoesNotExist:
                 return Response({"error": "존재하지 않는 세션입니다."}, status=status.HTTP_404_NOT_FOUND)
         else:
@@ -46,38 +136,46 @@ def process_prompt(request):
             
             # PromptSession 생성 - main_event는 초기에 None으로 설정
             history = PromptSession.objects.create(
-                video=video,
-                main_event=None,  # 초기에는 None, 나중에 relevant_event로 설정
-                first_prompt=prompt_text[:200] if prompt_text else ""
+                session_name=prompt_text[:50] if prompt_text else "New Session",
+                user_id=request.user.id if hasattr(request, 'user') and request.user.is_authenticated else ""
             )
+            # ManyToMany 필드는 create 후에 추가
+            history.related_videos.add(video)
         
         # 2. 프롬프트 처리 및 관련 이벤트 검색 (해당 비디오의 이벤트만)
-        response_text, relevant_event = process_prompt_logic(prompt_text, history.video)
+        response_text, relevant_event = process_prompt_logic(prompt_text, video)
         
         # 3. 세션의 main_event 설정 (첫 프롬프트인 경우)
         if not session_id and relevant_event and not history.main_event:
             # 해당 비디오의 이벤트인지 다시 한 번 확인
-            if relevant_event.video == history.video:
+            if video and relevant_event.video == video:
                 history.main_event = relevant_event
                 history.save()
             else:
-                print(f"⚠️ 경고: 다른 비디오의 이벤트가 반환됨. 세션 비디오: {history.video.name}, 이벤트 비디오: {relevant_event.video.name}")
+                print(f"⚠️ 경고: 다른 비디오의 이벤트가 반환됨. 세션 비디오: {video.name if video else 'None'}, 이벤트 비디오: {relevant_event.video.name}")
                 relevant_event = None  # 잘못된 이벤트는 무시
         
         # 4. 상호작용 저장 (찾은 이벤트 포함)
         interaction = PromptInteraction.objects.create(
             session=history,
-            video=history.video,  # video 필드 추가
-            input_prompt=prompt_text,
-            output_response=response_text,
-            detected_event=relevant_event  # 찾은 이벤트 저장
+            interaction_id=f"{history.session_id}_{history.total_interactions + 1}",
+            sequence_number=history.total_interactions + 1,
+            user_prompt=prompt_text,
+            ai_response=response_text
         )
+        
+        # ManyToMany 관계는 create 후에 추가
+        if relevant_event:
+            interaction.related_events.add(relevant_event)
+        
+        # 세션 통계 업데이트
+        history.add_interaction(prompt_text)
         
         # 5. 응답 반환
         result = {
             "session_id": history.session_id,
             "response": response_text,
-            "timestamp": interaction.timestamp.isoformat()
+            "timestamp": interaction.created_at.isoformat()
         }
         
         if relevant_event:
@@ -168,6 +266,354 @@ def get_session_detail(request, session_id):
     except Exception as e:
         return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
+@api_view(['POST'])
+def process_vlm_chat(request):
+    """
+    VLM(Vision Language Model) 기반 채팅 처리
+    - 영상 프레임 분석
+    - 장면 묘사
+    - 특정 타임라인 추출
+    - 위치별 행동 분석 (왼쪽/중간/오른쪽)
+    """
+    print(f"🎥 VLM 채팅 API 호출: {request.method}")
+    
+    try:
+        prompt_text = request.data.get('prompt')
+        session_id = request.data.get('session_id')
+        video_id = request.data.get('video_id')
+        
+        print(f"💭 프롬프트: {prompt_text}")
+        print(f"🆔 세션 ID: {session_id}")
+        print(f"🎥 비디오 ID: {video_id}")
+        
+        if not prompt_text:
+            return Response({"error": "프롬프트가 비어있습니다."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not video_id:
+            return Response({"error": "비디오 ID가 필요합니다."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # 1. 비디오 조회
+        try:
+            video = Video.objects.get(video_id=video_id)
+        except Video.DoesNotExist:
+            return Response({"error": "존재하지 않는 비디오입니다."}, status=status.HTTP_404_NOT_FOUND)
+        
+        # 2. 세션 생성 또는 조회
+        if session_id:
+            try:
+                session = PromptSession.objects.get(session_id=session_id)
+            except PromptSession.DoesNotExist:
+                return Response({"error": "존재하지 않는 세션입니다."}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            # 새 세션 생성
+            session = PromptSession.objects.create(
+                session_name=prompt_text[:50] if prompt_text else "VLM Chat",
+                user_id=request.user.id if hasattr(request, 'user') and request.user.is_authenticated else ""
+            )
+            # ManyToMany 필드는 create 후에 추가
+            session.related_videos.add(video)
+        
+        # 3. 해당 비디오의 이벤트 조회
+        events = Event.objects.filter(video=video).order_by('timestamp')
+        
+        # 4. VLM 서비스로 프롬프트 분석
+        vlm_service = get_vlm_service()
+        
+        # 5. 프롬프트 유형 분석 및 처리
+        response_text = ""
+        analysis_type = "general"
+        frame_data = None
+        
+        # 시간 범위 추출 (예: "10분에서 15분", "1분 30초부터 2분")
+        time_pattern = r'(\d+)\s*분(?:\s*(\d+)\s*초)?'
+        time_matches = re.findall(time_pattern, prompt_text)
+        
+        start_seconds = None
+        end_seconds = None
+        
+        if len(time_matches) >= 2:
+            # 시작 시간
+            start_min = int(time_matches[0][0])
+            start_sec = int(time_matches[0][1]) if time_matches[0][1] else 0
+            start_seconds = start_min * 60 + start_sec
+            
+            # 종료 시간
+            end_min = int(time_matches[1][0])
+            end_sec = int(time_matches[1][1]) if time_matches[1][1] else 0
+            end_seconds = end_min * 60 + end_sec
+            
+            print(f"⏰ 시간 범위 감지: {start_seconds}초 ~ {end_seconds}초")
+        
+        # 장면 묘사 요청
+        if any(keyword in prompt_text.lower() for keyword in ['장면', '묘사', '무슨 일', '설명', '상황']):
+            print("📸 장면 묘사 요청 감지")
+            analysis_type = "scene_description"
+            
+            if start_seconds is not None and end_seconds is not None:
+                # 특정 시간 범위 분석
+                response_text = vlm_service.analyze_time_range(
+                    video=video,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                    analysis_type="scene",
+                    interval=2.0
+                )
+            else:
+                # 전체 이벤트 기반 요약
+                response_text = vlm_service.generate_video_summary(
+                    video=video,
+                    events=list(events),
+                    summary_type="events"
+                )
+        
+        # 타임라인 추출 요청
+        elif any(keyword in prompt_text.lower() for keyword in ['타임라인', '시간', '언제', '몇 분', '몇 초']):
+            print("⏰ 타임라인 추출 요청 감지")
+            analysis_type = "timeline"
+            response_text = _generate_timeline_response(prompt_text, events, video)
+        
+        # 위치별 분석 요청
+        elif any(keyword in prompt_text.lower() for keyword in ['위치', '어디', '왼쪽', '중간', '오른쪽', '장소']):
+            print("📍 위치별 분석 요청 감지")
+            analysis_type = "location_analysis"
+            
+            if start_seconds is not None and end_seconds is not None:
+                # 특정 시간 범위의 위치 분석
+                response_text = vlm_service.analyze_time_range(
+                    video=video,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                    analysis_type="location",
+                    interval=1.5
+                )
+            else:
+                # 전체 위치 패턴 분석
+                response_text = _analyze_location_patterns(events, video)
+        
+        # 행동 분석 요청
+        elif any(keyword in prompt_text.lower() for keyword in ['행동', '무엇을', '어떤', '활동']):
+            print("🏃 행동 분석 요청 감지")
+            analysis_type = "behavior_analysis"
+            
+            if start_seconds is not None and end_seconds is not None:
+                # 특정 시간 범위의 행동 분석
+                response_text = vlm_service.analyze_time_range(
+                    video=video,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                    analysis_type="behavior",
+                    interval=1.5
+                )
+            else:
+                # 전체 행동 패턴 분석
+                response_text = _analyze_behaviors(events, video)
+        
+        # 일반 질문 - 하이브리드 RAG 사용
+        else:
+            print("💬 일반 질문 처리")
+            analysis_type = "general"
+            hybrid_search = get_hybrid_search_service()
+            response_text = hybrid_search.search_and_generate(
+                query=prompt_text,
+                video_id=video_id
+            )
+        
+        # 6. 상호작용 저장
+        interaction = PromptInteraction.objects.create(
+            session=session,
+            video=video,
+            input_prompt=prompt_text,
+            output_response=response_text,
+            detected_event=events.first() if events.exists() else None,
+            analysis_type=analysis_type
+        )
+        
+        # 7. 응답 반환
+        result = {
+            "session_id": session.session_id,
+            "response": response_text,
+            "timestamp": interaction.timestamp.isoformat(),
+            "analysis_type": analysis_type,
+            "event_count": events.count()
+        }
+        
+        # 관련 이벤트 정보 추가
+        if events.exists():
+            result["events"] = [
+                {
+                    "id": event.id,
+                    "timestamp": event.timestamp,
+                    "event_type": event.event_type,
+                    "action_detected": event.action_detected,
+                    "location": event.location
+                }
+                for event in events[:5]  # 최대 5개
+            ]
+        
+        print(f"✅ VLM 채팅 처리 완료: {analysis_type}")
+        return Response(result)
+        
+    except Exception as e:
+        print(f"❌ VLM 채팅 오류: {str(e)}")
+        import traceback
+        print(f"🔍 오류 스택: {traceback.format_exc()}")
+        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+def _generate_timeline_response(prompt: str, events, video: Video) -> str:
+    """타임라인 추출 및 응답 생성"""
+    if not events:
+        return "해당 영상에서 감지된 이벤트가 없습니다."
+    
+    # 시간 관련 키워드 추출
+    time_keywords = re.findall(r'(\d+)\s*분', prompt)
+    
+    response_parts = [f"📹 {video.name} 영상의 타임라인:\n"]
+    
+    if time_keywords:
+        # 특정 시간대 필터링
+        target_minutes = [int(m) for m in time_keywords]
+        filtered_events = [
+            e for e in events 
+            if int(e.timestamp // 60) in target_minutes
+        ]
+        
+        if filtered_events:
+            for event in filtered_events:
+                minutes = int(event.timestamp // 60)
+                seconds = int(event.timestamp % 60)
+                event_type_kr = {
+                    'theft': '도난',
+                    'collapse': '쓰러짐',
+                    'sitting': '점거',
+                    'violence': '폭력'
+                }.get(event.event_type, event.event_type)
+                
+                response_parts.append(
+                    f"⏰ {minutes}분 {seconds}초: {event_type_kr} - {event.action_detected or '행동 감지'} ({event.location or '위치 미상'})"
+                )
+        else:
+            response_parts.append(f"해당 시간대({', '.join([f'{m}분' for m in target_minutes])})에는 이벤트가 감지되지 않았습니다.")
+    else:
+        # 전체 타임라인
+        for event in events[:10]:  # 최대 10개
+            minutes = int(event.timestamp // 60)
+            seconds = int(event.timestamp % 60)
+            event_type_kr = {
+                'theft': '도난',
+                'collapse': '쓰러짐',
+                'sitting': '점거',
+                'violence': '폭력'
+            }.get(event.event_type, event.event_type)
+            
+            response_parts.append(
+                f"⏰ {minutes}분 {seconds}초: {event_type_kr} - {event.action_detected or '행동 감지'}"
+            )
+    
+    return "\n".join(response_parts)
+
+
+def _analyze_location_patterns(events, video: Video) -> str:
+    """위치별 행동 패턴 분석"""
+    if not events:
+        return "분석할 이벤트가 없습니다."
+    
+    # 위치별 집계
+    location_counts = {
+        'left': 0,
+        'center': 0,
+        'right': 0,
+        'unknown': 0
+    }
+    
+    location_events = {
+        'left': [],
+        'center': [],
+        'right': [],
+        'unknown': []
+    }
+    
+    for event in events:
+        location = event.location or ''
+        location_lower = location.lower()
+        
+        if 'left' in location_lower or '왼쪽' in location_lower:
+            location_counts['left'] += 1
+            location_events['left'].append(event)
+        elif 'center' in location_lower or '중앙' in location_lower or '중간' in location_lower:
+            location_counts['center'] += 1
+            location_events['center'].append(event)
+        elif 'right' in location_lower or '오른쪽' in location_lower:
+            location_counts['right'] += 1
+            location_events['right'].append(event)
+        else:
+            location_counts['unknown'] += 1
+            location_events['unknown'].append(event)
+    
+    # 응답 생성
+    response_parts = [f"📍 {video.name} 영상의 위치별 분석:\n"]
+    
+    total = sum(location_counts.values())
+    if total == 0:
+        return "위치 정보가 없는 이벤트입니다."
+    
+    # 위치별 통계
+    response_parts.append("📊 위치별 이벤트 분포:")
+    response_parts.append(f"- 왼쪽: {location_counts['left']}건 ({location_counts['left']/total*100:.1f}%)")
+    response_parts.append(f"- 중앙: {location_counts['center']}건 ({location_counts['center']/total*100:.1f}%)")
+    response_parts.append(f"- 오른쪽: {location_counts['right']}건 ({location_counts['right']/total*100:.1f}%)")
+    
+    # 가장 많이 발생한 위치
+    max_location = max(location_counts.items(), key=lambda x: x[1])
+    location_kr = {
+        'left': '왼쪽',
+        'center': '중앙',
+        'right': '오른쪽',
+        'unknown': '미상'
+    }.get(max_location[0], max_location[0])
+    
+    response_parts.append(f"\n✅ 가장 많은 활동: {location_kr} ({max_location[1]}건)")
+    
+    return "\n".join(response_parts)
+
+
+def _analyze_behaviors(events, video: Video) -> str:
+    """행동 패턴 분석"""
+    if not events:
+        return "분석할 이벤트가 없습니다."
+    
+    # 행동 타입별 집계
+    behavior_counts = {}
+    for event in events:
+        event_type = event.event_type
+        behavior_counts[event_type] = behavior_counts.get(event_type, 0) + 1
+    
+    # 응답 생성
+    response_parts = [f"🏃 {video.name} 영상의 행동 분석:\n"]
+    
+    for event_type, count in behavior_counts.items():
+        event_type_kr = {
+            'theft': '도난',
+            'collapse': '쓰러짐',
+            'sitting': '점거',
+            'violence': '폭력'
+        }.get(event_type, event_type)
+        
+        response_parts.append(f"- {event_type_kr}: {count}건")
+    
+    # 대표 행동 예시
+    response_parts.append("\n📝 주요 행동 예시:")
+    for event in events[:3]:
+        minutes = int(event.timestamp // 60)
+        seconds = int(event.timestamp % 60)
+        response_parts.append(
+            f"- {minutes}분 {seconds}초: {event.action_detected or '행동 감지'}"
+        )
+    
+    return "\n".join(response_parts)
+
+
 # Video API Views
 @api_view(['GET', 'POST'])
 def video_list_create(request):
@@ -251,99 +697,68 @@ def check_duplicate_video(request):
 
 def process_prompt_logic(prompt_text, video=None):
     """
-    프롬프트 처리 로직 - FastAPI text2sql 호출
+    프롬프트 처리 로직 - AWS Bedrock 하이브리드 RAG
     
-    1. FastAPI에 프롬프트 전송하여 SQL 생성
-    2. 생성된 SQL로 타임스탬프 추출
-    3. DB 쿼리 실행 (특정 비디오로 제한)
-    4. 타임라인 추출 → 영상 캡쳐
-    5. VLM에 캡쳐 이미지 + 프롬프트 전송
-    6. 응답 생성
+    1. Text2SQL: 정확한 조건 검색 (timestamp, event_type 등)
+    2. pgvector: 의미 기반 유사도 검색 (임베딩)
+    3. 결과 병합 및 중복 제거
+    4. Bedrock RAG: 자연어 응답 생성
     
     Args:
         prompt_text: 사용자 프롬프트
         video: 대상 비디오 객체 (None이면 전체 검색)
     """
+    use_bedrock = getattr(settings, 'USE_BEDROCK', True)
+    use_hybrid_search = getattr(settings, 'USE_HYBRID_SEARCH', True)
+    
     try:
-        # 1. FastAPI text2sql 호출
-        fastapi_url = "http://localhost:8087/api/process"
-        fastapi_payload = {"prompt": prompt_text}
-        
-        print(f"FastAPI 호출: {fastapi_url}")
-        print(f"Payload: {fastapi_payload}")
-        
-        response = requests.post(
-            fastapi_url,
-            json=fastapi_payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            return f"FastAPI 호출 실패: {response.status_code}", None
+        # ============================================
+        # 하이브리드 RAG: Text2SQL + pgvector
+        # ============================================
+        if use_bedrock and use_hybrid_search:
+            print(f"🚀 하이브리드 RAG 검색 사용 (Text2SQL + pgvector)")
+            hybrid_service = get_hybrid_search_service()
             
-        text2sql_result = response.json()
-        print(f"FastAPI 응답: {text2sql_result}")
-        
-        # 2. SQL 쿼리 추출 및 실행
-        # FastAPI 응답 구조에 맞춰 'result' 키 사용
-        if 'result' not in text2sql_result:
-            return "SQL 쿼리가 생성되지 않았습니다.", None
+            found_events, response_text = hybrid_service.hybrid_search(
+                prompt=prompt_text,
+                video=video,
+                use_vector_search=True,  # pgvector 검색 활성화
+                use_text2sql=True         # Text2SQL 검색 활성화
+            )
             
-        sql_query = text2sql_result['result']
-        print(f"생성된 SQL: {sql_query}")
+            relevant_event = found_events[0] if found_events else None
+            return response_text, relevant_event
         
-        # Django 테이블 이름으로 변환
-        sql_query = sql_query.replace('events', 'db_event')
-        sql_query = sql_query.replace('videos', 'db_video')
-        
-        # 특정 비디오로 제한하는 WHERE 조건 추가
-        if video:
-            # 기존 WHERE 절이 있는지 확인
-            if 'WHERE' in sql_query.upper():
-                # 기존 WHERE 절에 AND 조건 추가
-                sql_query = sql_query.replace('WHERE', f'WHERE db_event.video_id = {video.video_id} AND')
-            else:
-                # WHERE 절이 없으면 추가
-                # FROM 절 다음에 WHERE 절 추가
-                sql_query = re.sub(r'(FROM\s+\w+)', r'\1 WHERE db_event.video_id = ' + str(video.video_id), sql_query, flags=re.IGNORECASE)
+        # ============================================
+        # 1. Text2SQL: 프롬프트 → SQL 변환 (Bedrock Only)
+        # ============================================
+        elif use_bedrock:
+            print(f"🤖 Bedrock Text2SQL 사용")
+            bedrock_service = get_bedrock_service()
             
-            print(f"비디오 필터링 적용됨: video_id = {video.video_id}")
-            print(f"필터링된 SQL: {sql_query}")
+            video_id = video.video_id if video else None
+            text2sql_result = bedrock_service.text_to_sql(
+                prompt=prompt_text,
+                video_id=video_id
+            )
+            
+            if text2sql_result.get('error'):
+                return f"SQL 생성 오류: {text2sql_result['error']}", None
+            
+            sql_query = text2sql_result.get('sql')
+            print(f"✅ Bedrock이 생성한 SQL: {sql_query}")
+            
+        else:
+            # Bedrock이 비활성화된 경우 에러 반환
+            return "Bedrock이 비활성화되어 있습니다. USE_BEDROCK=true로 설정하세요.", None
         
-        # PostgreSQL TIME 타입을 초 단위 정수로 변환
-        # 예: TIME '10:00:00' -> 36000 (10시간 * 3600초)
-        # 예: TIME '13:00:00' -> 46800 (13시간 * 3600초)
-        import re
+        # ============================================
+        # 2. SQL 실행 및 데이터 검색
+        # ============================================
+        if not sql_query:
+            return "SQL 쿼리를 생성하지 못했습니다.", None
         
-        def time_to_seconds(time_str):
-            """TIME '10:00:00' -> 36000초 변환"""
-            time_match = re.search(r"TIME '(\d{2}):(\d{2}):(\d{2})'", time_str)
-            if time_match:
-                hours, minutes, seconds = map(int, time_match.groups())
-                total_seconds = hours * 3600 + minutes * 60 + seconds
-                return str(total_seconds)
-            return time_str
-        
-        # timestamp::time 패턴을 timestamp로 변경
-        sql_query = re.sub(r'timestamp::time', 'timestamp', sql_query)
-        
-        # TIME '시:분:초' 패턴을 초 단위로 변환
-        time_pattern = r"TIME '(\d{2}):(\d{2}):(\d{2})'"
-        def replace_time(match):
-            hours, minutes, seconds = map(int, match.groups())
-            total_seconds = hours * 3600 + minutes * 60 + seconds
-            return str(total_seconds)
-        
-        sql_query = re.sub(time_pattern, replace_time, sql_query)
-        
-        print(f"Django 테이블명으로 변환된 SQL: {sql_query}")
-        
-        # 3. 질문 분류 (SQL 및 프롬프트 기반)
-        question_type = classify_question_type(prompt_text, sql_query)
-        print(f"🔍 질문 분류: {question_type}")
-        
-        # 4. DB에서 쿼리 실행
+        # DB에서 쿼리 실행
         with connection.cursor() as cursor:
             cursor.execute(sql_query)
             query_results = cursor.fetchall()
@@ -351,19 +766,20 @@ def process_prompt_logic(prompt_text, video=None):
         if not query_results:
             return "요청하신 조건에 해당하는 이벤트를 찾을 수 없습니다.", None
             
-        print(f"쿼리 결과: {query_results}")
+        print(f"✅ 쿼리 결과: {len(query_results)}개 발견")
         
-        # 5. 실제 이벤트 데이터 조회하여 상세 응답 생성
+        # ============================================
+        # 3. 이벤트 객체 조회 및 정리
+        # ============================================
         found_events = []
         relevant_event = None
         
         for result in query_results:
             try:
-                # SQL 쿼리 결과는 timestamp 값이므로 timestamp로 검색
+                # timestamp 값 추출 (첫 번째 컬럼 가정)
                 timestamp_value = result[0]
-                print(f"🔍 SQL 결과에서 timestamp 값: {timestamp_value}")
                 
-                # 해당 비디오의 해당 timestamp 이벤트 검색
+                # Event 객체 조회
                 if video:
                     events = Event.objects.filter(timestamp=timestamp_value, video=video)
                 else:
@@ -372,30 +788,61 @@ def process_prompt_logic(prompt_text, video=None):
                 if events.exists():
                     event = events.first()
                     found_events.append(event)
-                    print(f"✅ timestamp {timestamp_value}로 이벤트 발견: ID={event.id}, 타입={event.event_type}")
                     
                     # 첫 번째 이벤트를 relevant_event로 설정
                     if relevant_event is None:
                         relevant_event = event
-                        print(f"✅ 주요 이벤트 매핑: ID={relevant_event.id}, timestamp={relevant_event.timestamp}, 비디오={relevant_event.video.name}, 타입={relevant_event.event_type}")
-                else:
-                    print(f"⚠️ 해당 비디오에서 timestamp {timestamp_value}에 해당하는 이벤트를 찾을 수 없음")
+                        
             except Exception as e:
-                print(f"이벤트 매핑 오류: {e}")
+                print(f"⚠️ 이벤트 매핑 오류: {e}")
         
-        # 5. 질문 타입별 처리 및 응답 생성
-        if question_type == 'ABNORMAL_BEHAVIOR':
-            # 이상행동 질문: 같은 시나리오 그룹화 후 첫 번째 timestamp 반환
-            response_text, relevant_event = process_abnormal_behavior_query(found_events)
+        if not found_events:
+            return "이벤트를 찾았으나 상세 정보를 조회할 수 없습니다.", None
+        
+        # ============================================
+        # 4. Bedrock RAG: 자연어 응답 생성
+        # ============================================
+        if use_bedrock:
+            print(f"🤖 Bedrock RAG를 통해 응답 생성")
+            bedrock_service = get_bedrock_service()
+            
+            # Event 객체를 딕셔너리로 변환
+            events_data = []
+            for event in found_events:
+                events_data.append({
+                    'timestamp': event.timestamp,
+                    'event_type': event.event_type,
+                    'action_detected': event.action_detected,
+                    'location': event.location,
+                    'age': event.age,
+                    'gender': event.gender,
+                    'scene_analysis': event.scene_analysis,
+                })
+            
+            video_name = video.name if video else "알 수 없음"
+            
+            response_text = bedrock_service.format_timeline_response(
+                prompt=prompt_text,
+                events=events_data,
+                video_name=video_name
+            )
+            
         else:
-            # 마케팅 질문: 개별 이벤트 나열
-            response_text, relevant_event = process_marketing_query(found_events)
+            # 기존 질문 타입별 처리 (폴백)
+            print(f"🔄 기존 질문 분류 방식 사용 (폴백)")
+            question_type = classify_question_type(prompt_text, sql_query)
+            
+            if question_type == 'ABNORMAL_BEHAVIOR':
+                response_text, relevant_event = process_abnormal_behavior_query(found_events)
+            else:
+                response_text, relevant_event = process_marketing_query(found_events)
         
         return response_text, relevant_event
         
-    except requests.exceptions.RequestException as e:
-        return f"FastAPI 연결 오류: {str(e)}", None
     except Exception as e:
+        print(f"❌ 처리 중 오류 발생: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return f"처리 중 오류 발생: {str(e)}", None
 
 
